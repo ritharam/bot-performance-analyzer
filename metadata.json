@@ -1,0 +1,5 @@
+{
+  "name": "Bot Performance Analyzer Final",
+  "description": "A universal dashboard for analyzing chatbot performance, categorizing resolution gaps into actionable buckets, and generating professional reports for any Yellow.ai or standard bot export.",
+  "requestFramePermissions": []
+}
