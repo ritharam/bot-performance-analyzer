@@ -2,9 +2,9 @@ import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
-import { analyzeConversations } from './services/geminiService';
+import { analyzeConversations } from './services/aiService';
 import { generateBotSummary } from './services/botProcessor';
-import { ConversationRow, AnalysisSummary, AnalysisResult, BucketRecommendation } from './types';
+import { ConversationRow, AnalysisSummary, AnalysisResult, BucketRecommendation, ModelOption } from './types';
 
 // Access globally loaded PDF libraries
 declare const html2canvas: any;
@@ -15,12 +15,16 @@ type ViewMode = 'setup' | 'dashboard' | 'report';
 const App: React.FC = () => {
   const [viewMode, setViewMode] = useState<ViewMode>('setup');
   const [botId, setBotId] = useState('');
+  const [botTitle, setBotTitle] = useState('');
   const [goals, setGoals] = useState('');
+  const [geminiApiKey, setGeminiApiKey] = useState('');
+  const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [csvData, setCsvData] = useState<ConversationRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [rawBotJson, setRawBotJson] = useState<any>(null);
   const [botSummary, setBotSummary] = useState<string | null>(null);
   const [analysisResult, setAnalysisResult] = useState<any>(null);
+  const [selectedModel, setSelectedModel] = useState<ModelOption>('gpt-4.1');
   const [activeTab, setActiveTab] = useState<'summary' | 'bucket1' | 'bucket2' | 'bucket3' | 'raw'>('summary');
 
   // Filter States for Raw Data
@@ -36,7 +40,7 @@ const App: React.FC = () => {
 
   const uniqueFilters = useMemo(() => {
     if (!analysisResult) return { outcomes: [], topics: [] };
-    const rowsInScope = analysisResult.categorizedRows.filter((r: any) => 
+    const rowsInScope = analysisResult.categorizedRows.filter((r: any) =>
       filterCluster === '' || (r.BUCKET || '0').trim() === filterCluster
     );
     const outcomes = Array.from(new Set(rowsInScope.map((r: any) => (r.RESOLUTION_STATUS || '').trim()).filter(Boolean))).sort();
@@ -57,10 +61,13 @@ const App: React.FC = () => {
         try {
           const data = JSON.parse(event.target?.result as string);
           setRawBotJson(data);
-          
-          // Try to extract botId from JSON if it's a standard Yellow.ai export
+
+          // Try to extract botId and botTitle from JSON if it's a standard Yellow.ai export
           const extractedId = data?.data?.bot || data?.bot || '';
           if (extractedId) setBotId(extractedId);
+
+          const extractedTitle = data?.data?.botName || data?.botName || data?.title || '';
+          if (extractedTitle) setBotTitle(extractedTitle);
 
           setBotSummary(generateBotSummary(data));
           alert("Bot JSON uploaded successfully.");
@@ -73,7 +80,7 @@ const App: React.FC = () => {
   const downloadSummaryTxt = () => {
     if (!botSummary) return;
     const element = document.createElement("a");
-    const file = new Blob([botSummary], {type: 'text/plain'});
+    const file = new Blob([botSummary], { type: 'text/plain' });
     element.href = URL.createObjectURL(file);
     element.download = `bot_summary_${botId || 'manual'}.txt`;
     document.body.appendChild(element);
@@ -110,11 +117,18 @@ const App: React.FC = () => {
     if (!botSummary || csvData.length === 0) return alert("Please configure bot context and upload chat logs.");
     setLoading(true);
     try {
-      const result = await analyzeConversations(csvData, botSummary, goals);
+      const result = await analyzeConversations(
+        csvData,
+        botSummary,
+        goals,
+        selectedModel,
+        geminiApiKey,
+        openaiApiKey
+      );
       setAnalysisResult(result);
       setViewMode('dashboard');
       setActiveTab('summary');
-    } catch (error) { alert("AI Analysis failed."); } finally { setLoading(false); }
+    } catch (error) { alert(`AI Analysis failed: ${error instanceof Error ? error.message : String(error)}`); } finally { setLoading(false); }
   };
 
   const summary = useMemo<AnalysisSummary>(() => {
@@ -157,7 +171,7 @@ const App: React.FC = () => {
       reportElement.setAttribute('style', originalStyle);
       const imgData = canvas.toDataURL('image/png');
       const { jsPDF } = jspdf;
-      const pdf = new jsPDF('l', 'mm', 'a4'); 
+      const pdf = new jsPDF('l', 'mm', 'a4');
       const imgProps = pdf.getImageProperties(imgData);
       const pdfWidth = pdf.internal.pageSize.getWidth();
       const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
@@ -172,13 +186,13 @@ const App: React.FC = () => {
         pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, pdfHeight);
         heightLeft -= pageHeight;
       }
-      pdf.save(`Strategic_Audit_${botId || 'RE'}.pdf`);
+      pdf.save(`${botTitle || botId || 'Strategic_Audit'}.pdf`);
     } catch (err) { alert("PDF generation failed."); } finally { setLoading(false); }
   };
 
   const handleExportExcel = () => {
     if (!analysisResult) return;
-    
+
     const reportElement = document.getElementById('report-content');
     const originalStyle = reportElement?.getAttribute('style') || '';
     if (reportElement) {
@@ -228,7 +242,7 @@ const App: React.FC = () => {
     const auditHeader = ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
     const auditRows = analysisResult.categorizedRows.map((r: any) => {
       const bucketName = r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : r.BUCKET === '3' ? 'GAPS' : 'RESOLVED';
-      
+
       const rowData = [
         bucketName,
         r.RESOLUTION_STATUS,
@@ -243,7 +257,7 @@ const App: React.FC = () => {
 
     if (reportElement) reportElement.setAttribute('style', originalStyle);
 
-    XLSX.writeFile(wb, `Bot_Strategic_Audit_${botId || 'RE'}.xlsx`);
+    XLSX.writeFile(wb, `${botTitle || botId || 'Strategic_Audit'}.xlsx`);
   };
 
   const tabs = [
@@ -284,10 +298,10 @@ const App: React.FC = () => {
         {viewMode === 'setup' && (
           <div className="bg-white p-12 rounded-[3.5rem] shadow-2xl border border-slate-100 animate-fadeIn print:hidden max-w-7xl mx-auto">
             <div className="text-center mb-16"><h2 className="text-4xl font-black text-slate-900 mb-4 tracking-tight">Strategy Configuration</h2><p className="text-slate-500 text-lg">Initialize context to generate optimization recommendations.</p></div>
-            <div className="grid lg:grid-cols-3 gap-10 mb-16">
+            <div className="grid lg:grid-cols-2 xl:grid-cols-3 gap-10 mb-16">
               <div className="p-8 bg-indigo-50/50 border border-indigo-100 rounded-[2.5rem] flex flex-col">
                 <h3 className="text-xs font-black text-indigo-900 uppercase tracking-widest mb-6">1. Bot Configuration</h3>
-                
+
                 <div className="mb-6 space-y-4">
                   <p className="text-[11px] font-bold text-slate-600 leading-relaxed">
                     To perform a deep analysis, please provide your bot's configuration JSON.
@@ -303,7 +317,7 @@ const App: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="relative group flex-1 min-h-[140px] mb-4">
+                <div className="relative group flex-1 min-h-[140px] mb-6">
                   <input type="file" accept=".json" onChange={handleManualJsonUpload} className="absolute inset-0 opacity-0 cursor-pointer z-10" />
                   <div className={`h-full border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all duration-300 ${rawBotJson ? 'bg-indigo-600 border-indigo-600 shadow-lg' : 'border-slate-300 group-hover:bg-white group-hover:border-indigo-400'}`}>
                     <div className={`h-12 w-12 rounded-full flex items-center justify-center mb-3 ${rawBotJson ? 'bg-white/20' : 'bg-slate-100'}`}>
@@ -315,9 +329,22 @@ const App: React.FC = () => {
                   </div>
                 </div>
 
+                <div className="mb-6 space-y-3">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2 flex items-center gap-2">
+                    <i className="fas fa-robot text-indigo-400"></i> Custom Bot Title (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={botTitle}
+                    onChange={(e) => setBotTitle(e.target.value)}
+                    placeholder="Enter bot name (e.g. Royal Enfield Assistant)"
+                    className="w-full bg-white border border-slate-200 rounded-2xl px-5 py-4 text-xs font-bold outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-sm"
+                  />
+                </div>
+
                 {botSummary && <button onClick={downloadSummaryTxt} className="w-full bg-slate-900 text-white py-3 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-black transition-all">Download summary.txt</button>}
               </div>
-              
+
               <div className="p-8 bg-emerald-50/50 border border-emerald-100 rounded-[2.5rem] flex flex-col">
                 <h3 className="text-xs font-black text-emerald-900 uppercase tracking-widest mb-6">2. Performance Data</h3>
                 <div className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[2rem] p-8 relative hover:bg-white transition-all group">
@@ -330,6 +357,8 @@ const App: React.FC = () => {
                 <h3 className="text-xs font-black text-amber-900 uppercase tracking-widest mb-6">3. Strategic Goals</h3>
                 <textarea value={goals} onChange={(e) => setGoals(e.target.value)} placeholder="What are your goals?" className="flex-1 w-full bg-white border border-slate-200 rounded-[1.5rem] p-6 text-sm resize-none outline-none focus:ring-2 focus:ring-amber-500" />
               </div>
+
+
             </div>
             <button onClick={startAnalysis} disabled={loading || !botSummary || csvData.length === 0} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? 'Processing...' : 'Analyze Performance'}</button>
           </div>
@@ -351,7 +380,14 @@ const App: React.FC = () => {
         {viewMode === 'report' && analysisResult && (
           <div id="report-content" className="report-container bg-white rounded-[2rem] shadow-xl border border-slate-100 p-8 animate-fadeIn max-w-full print:shadow-none print:p-0">
             <div className="flex justify-between items-center border-b-4 border-slate-900 pb-4 mb-8">
-              <div><h1 className="text-3xl font-black uppercase text-slate-900 tracking-tighter">Strategic Performance Audit</h1><p className="text-slate-500 font-bold text-xs uppercase tracking-widest">Royal Enfield | RE-{botId || 'Default'}</p></div>
+              <div>
+                <h1 className="text-3xl font-black uppercase text-slate-900 tracking-tighter">
+                  {botTitle ? `${botTitle} - Strategic Audit` : 'Strategic Performance Audit'}
+                </h1>
+                <p className="text-slate-500 font-bold text-xs uppercase tracking-widest">
+                  {botTitle || 'Royal Enfield Bot'} | RE-{botId || 'Default'}
+                </p>
+              </div>
               <div className="text-right"><p className="text-[9px] font-black uppercase text-slate-400">Analysis Date</p><p className="text-sm font-bold">{new Date().toLocaleDateString()}</p></div>
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 items-start print:grid-cols-4 print:gap-4">
@@ -376,8 +412,8 @@ const SummaryView: React.FC<{ summary: AnalysisSummary; isReport?: boolean }> = 
       <KpiCard title="KB Gaps" value={summary.bucketDistribution['3']} icon="fa-database" color="emerald" isReport={isReport} />
     </div>
     <div className={`grid ${isReport ? 'grid-cols-1 gap-4' : 'lg:grid-cols-2 gap-16'}`}>
-      <div className={`${isReport ? 'p-4' : 'p-12'} border rounded-[1.5rem] bg-slate-50/20`}><h3 className="text-[8px] font-black mb-4 text-center uppercase tracking-widest text-slate-400">Outcomes</h3><div className={`${isReport ? 'h-[150px]' : 'h-[350px]'}`}><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={Object.entries(summary.statusBreakdown).map(([n,v])=>({n,v}))} cx="50%" cy="50%" innerRadius={isReport ? 30 : 80} outerRadius={isReport ? 50 : 120} paddingAngle={5} dataKey="v"><Cell fill="#4f46e5"/><Cell fill="#f43f5e"/><Cell fill="#f59e0b"/><Cell fill="#10b981"/><Cell fill="#6366f1"/></Pie>{!isReport && <Tooltip/>}{!isReport && <Legend verticalAlign="bottom"/>}</PieChart></ResponsiveContainer></div></div>
-      {!isReport && (<div className="p-12 border rounded-[2rem] bg-slate-50/20"><h3 className="text-xs font-black mb-10 text-center uppercase tracking-widest text-slate-400">Pillar Mapping</h3><div className="h-[350px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={[{ name: 'Expansion', value: summary.bucketDistribution['1'], fill: '#f43f5e' },{ name: 'Optimization', value: summary.bucketDistribution['2'], fill: '#f59e0b' },{ name: 'Knowledge', value: summary.bucketDistribution['3'], fill: '#10b981' },]}><CartesianGrid strokeDasharray="3 3" vertical={false}/><XAxis dataKey="name"/><YAxis/><Tooltip/><Bar dataKey="value" radius={[10, 10, 0, 0]}/></BarChart></ResponsiveContainer></div></div>)}
+      <div className={`${isReport ? 'p-4' : 'p-12'} border rounded-[1.5rem] bg-slate-50/20`}><h3 className="text-[8px] font-black mb-4 text-center uppercase tracking-widest text-slate-400">Outcomes</h3><div className={`${isReport ? 'h-[150px]' : 'h-[350px]'}`}><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={Object.entries(summary.statusBreakdown).map(([n, v]) => ({ n, v }))} cx="50%" cy="50%" innerRadius={isReport ? 30 : 80} outerRadius={isReport ? 50 : 120} paddingAngle={5} dataKey="v"><Cell fill="#4f46e5" /><Cell fill="#f43f5e" /><Cell fill="#f59e0b" /><Cell fill="#10b981" /><Cell fill="#6366f1" /></Pie>{!isReport && <Tooltip />}{!isReport && <Legend verticalAlign="bottom" />}</PieChart></ResponsiveContainer></div></div>
+      {!isReport && (<div className="p-12 border rounded-[2rem] bg-slate-50/20"><h3 className="text-xs font-black mb-10 text-center uppercase tracking-widest text-slate-400">Pillar Mapping</h3><div className="h-[350px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={[{ name: 'Expansion', value: summary.bucketDistribution['1'], fill: '#f43f5e' }, { name: 'Optimization', value: summary.bucketDistribution['2'], fill: '#f59e0b' }, { name: 'Knowledge', value: summary.bucketDistribution['3'], fill: '#10b981' },]}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" /><YAxis /><Tooltip /><Bar dataKey="value" radius={[10, 10, 0, 0]} /></BarChart></ResponsiveContainer></div></div>)}
     </div>
   </div>
 );
@@ -387,8 +423,8 @@ const BucketListView: React.FC<{ recs: BucketRecommendation[]; activeTab: string
     {recs.length === 0 && isReport && (<div className="p-8 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200"><p className="text-[9px] font-black uppercase text-slate-300">No issues identified</p></div>)}
     {recs.map((rec, i) => {
       // CRITICAL FIX: Dynamically calculate count from data indices to ensure raw audit match
-      const actualCount = Array.isArray((rec as any).indices) 
-        ? (rec as any).indices.filter((idx: number) => categorizedRows[idx]).length 
+      const actualCount = Array.isArray((rec as any).indices)
+        ? (rec as any).indices.filter((idx: number) => categorizedRows[idx]).length
         : rec.count;
 
       return (
@@ -425,12 +461,12 @@ const BucketListView: React.FC<{ recs: BucketRecommendation[]; activeTab: string
 
 const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterCluster, filterOutcome, setFilterOutcome, filterTopic, setFilterTopic, uniqueFilters }) => (
   <div className="space-y-10">
-     <div className="grid grid-cols-1 md:grid-cols-3 gap-8 bg-slate-50 p-10 rounded-[3rem] border border-slate-100">
-        <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Strategic Bucket</label><select value={filterCluster} onChange={(e) => setFilterCluster(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Buckets</option><option value="1">Service Expansion</option><option value="2">System Optimization</option><option value="3">Information Gaps</option></select></div>
-        <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Outcome</label><select value={filterOutcome} onChange={(e) => setFilterOutcome(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Outcomes</option>{uniqueFilters.outcomes.map((o:any)=><option key={o} value={o}>{o}</option>)}</select></div>
-        <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Topic Cluster</label><select value={filterTopic} onChange={(e) => setFilterTopic(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Topics</option>{uniqueFilters.topics.map((t:any)=><option key={t} value={t}>{t}</option>)}</select></div>
-     </div>
-     <div className="overflow-x-auto"><table className="w-full text-left text-xs table-fixed"><thead className="border-b-4 border-slate-100 uppercase text-slate-400 font-black tracking-widest"><tr><th className="p-8 w-[150px]">Pillar</th><th className="p-8 w-[160px]">Outcome</th><th className="p-8 w-[180px]">Topic</th><th className="p-8">Query</th><th className="p-8 w-[100px]">Audit</th></tr></thead><tbody className="divide-y divide-slate-50">{filteredRows.map((r:any, i:number) => (<tr key={i} className="hover:bg-slate-50 transition-colors"><td className="p-8 align-top"><span className={`px-4 py-2 rounded-xl font-black text-[9px] uppercase tracking-widest ${r.BUCKET==='1'?'bg-rose-100 text-rose-700':r.BUCKET==='2'?'bg-amber-100 text-amber-700':r.BUCKET==='3'?'bg-emerald-100 text-emerald-700':'bg-slate-100 text-slate-400'}`}>{r.BUCKET==='0'?'RESOLVED':r.BUCKET==='1'?'EXPANSION':r.BUCKET==='2'?'OPTIMIZE':'GAPS'}</span></td><td className="p-8 font-black text-slate-700 align-top">{r.RESOLUTION_STATUS}</td><td className="p-8 font-bold text-slate-400 uppercase tracking-tighter align-top break-words">{r.TOPIC}</td><td className="p-8 font-medium text-slate-900 leading-relaxed align-top break-words">{r.USER_QUERY}</td><td className="p-8 align-top">{r.CHATURL ? <a href={r.CHATURL} target="_blank" className="text-indigo-600 font-black hover:text-indigo-900">Link</a> : "--"}</td></tr>))}</tbody></table></div>
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-8 bg-slate-50 p-10 rounded-[3rem] border border-slate-100">
+      <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Strategic Bucket</label><select value={filterCluster} onChange={(e) => setFilterCluster(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Buckets</option><option value="1">Service Expansion</option><option value="2">System Optimization</option><option value="3">Information Gaps</option></select></div>
+      <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Outcome</label><select value={filterOutcome} onChange={(e) => setFilterOutcome(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Outcomes</option>{uniqueFilters.outcomes.map((o: any) => <option key={o} value={o}>{o}</option>)}</select></div>
+      <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Topic Cluster</label><select value={filterTopic} onChange={(e) => setFilterTopic(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Topics</option>{uniqueFilters.topics.map((t: any) => <option key={t} value={t}>{t}</option>)}</select></div>
+    </div>
+    <div className="overflow-x-auto"><table className="w-full text-left text-xs table-fixed"><thead className="border-b-4 border-slate-100 uppercase text-slate-400 font-black tracking-widest"><tr><th className="p-8 w-[150px]">Pillar</th><th className="p-8 w-[160px]">Outcome</th><th className="p-8 w-[180px]">Topic</th><th className="p-8">Query</th><th className="p-8 w-[100px]">Audit</th></tr></thead><tbody className="divide-y divide-slate-50">{filteredRows.map((r: any, i: number) => (<tr key={i} className="hover:bg-slate-50 transition-colors"><td className="p-8 align-top"><span className={`px-4 py-2 rounded-xl font-black text-[9px] uppercase tracking-widest ${r.BUCKET === '1' ? 'bg-rose-100 text-rose-700' : r.BUCKET === '2' ? 'bg-amber-100 text-amber-700' : r.BUCKET === '3' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'}`}>{r.BUCKET === '0' ? 'RESOLVED' : r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : 'GAPS'}</span></td><td className="p-8 font-black text-slate-700 align-top">{r.RESOLUTION_STATUS}</td><td className="p-8 font-bold text-slate-400 uppercase tracking-tighter align-top break-words">{r.TOPIC}</td><td className="p-8 font-medium text-slate-900 leading-relaxed align-top break-words">{r.USER_QUERY}</td><td className="p-8 align-top">{r.CHATURL ? <a href={r.CHATURL} target="_blank" className="text-indigo-600 font-black hover:text-indigo-900">Link</a> : "--"}</td></tr>))}</tbody></table></div>
   </div>
 );
 

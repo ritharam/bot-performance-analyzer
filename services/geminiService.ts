@@ -2,9 +2,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { ConversationRow, AnalysisResult } from "../types";
 
-// const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
 function safeJsonParse<T>(text: string | undefined, defaultValue: T): T {
   if (!text || !text.trim()) return defaultValue;
   try {
@@ -16,11 +13,14 @@ function safeJsonParse<T>(text: string | undefined, defaultValue: T): T {
   }
 }
 
-export const analyzeConversations = async (
+export const analyzeWithGemini = async (
   csvData: ConversationRow[],
   botSummary: string,
-  goals: string
+  goals: string,
+  apiKey?: string
 ): Promise<AnalysisResult> => {
+  const activeApiKey = apiKey || process.env.GEMINI_API_KEY;
+  const ai = new GoogleGenAI({ apiKey: activeApiKey || "" });
   const MAX_RECORDS = 100; // Increased limit for better breadth
   const processData = csvData.slice(0, MAX_RECORDS);
 

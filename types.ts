@@ -1,4 +1,6 @@
 
+export type ModelOption = 'gemini-flash' | 'gpt-4o' | 'gpt-4o-mini' | 'gpt-4' | 'gpt-4.1' | 'gpt-5.2';
+
 export interface ConversationRow {
   CHATURL: string;
   TOPIC: string;
