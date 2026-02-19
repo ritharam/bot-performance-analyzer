@@ -10,12 +10,13 @@ export const analyzeConversations = async (
     model: ModelOption,
     customGeminiKey?: string,
     customOpenAIKey?: string,
-    standardLogData?: any[]
+    standardLogData?: any[],
+    chatLogData?: any[]
 ): Promise<AnalysisResult> => {
     if (model === 'gemini-flash') {
-        return analyzeWithGemini(csvData, botSummary, goals, customGeminiKey, standardLogData);
+        return analyzeWithGemini(csvData, botSummary, goals, customGeminiKey, standardLogData, chatLogData);
     } else {
         // OpenAI models
-        return analyzeWithOpenAI(csvData, botSummary, goals, model, customOpenAIKey, standardLogData);
+        return analyzeWithOpenAI(csvData, botSummary, goals, model, customOpenAIKey, standardLogData, chatLogData);
     }
 };

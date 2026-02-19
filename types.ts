@@ -27,6 +27,22 @@ export interface StandardLogRow {
   BOT_SUMMARY: string;
 }
 
+export interface ChatLogRow {
+  'Created Date': string;
+  'Bot Id': string;
+  'UID': string;
+  'Message': string;
+  'Message Type': string;
+  'Session Id': string;
+  'Journey:Step': string;
+  'Source': string;
+  'Interaction medium': string;
+  'Node type': string;
+  'Feedback': string;
+  'Language': string;
+  'Translated message': string;
+}
+
 export interface BucketRecommendation {
   topic: string;
   count: number;

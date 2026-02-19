@@ -21,6 +21,7 @@ const App: React.FC = () => {
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [csvData, setCsvData] = useState<ConversationRow[]>([]);
   const [standardLogData, setStandardLogData] = useState<any[]>([]);
+  const [chatLogData, setChatLogData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [rawBotJson, setRawBotJson] = useState<any>(null);
   const [botSummary, setBotSummary] = useState<string | null>(null);
@@ -146,14 +147,43 @@ const App: React.FC = () => {
             USER_SUMMARY: r.USER_SUMMARY || '',
             BOT_SUMMARY: r.BOT_SUMMARY || ''
           })));
-          alert("Standard Log uploaded successfully.");
+          alert("Voice Logs uploaded successfully.");
+        }
+      });
+    }
+  };
+
+  const handleChatLogUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: (results) => {
+          const rows = results.data as any[];
+          setChatLogData(rows.map((r) => ({
+            'Created Date': r['Created Date'] || '',
+            'Bot Id': r['Bot Id'] || '',
+            'UID': r['UID'] || '',
+            'Message': r['Message'] || r.Message || '',
+            'Message Type': r['Message Type'] || '',
+            'Session Id': r['Session Id'] || '',
+            'Journey:Step': r['Journey:Step'] || '',
+            'Source': r['Source'] || '',
+            'Interaction medium': r['Interaction medium'] || '',
+            'Node type': r['Node type'] || '',
+            'Feedback': r['Feedback'] || '',
+            'Language': r['Language'] || '',
+            'Translated message': r['Translated message'] || ''
+          })));
+          alert("Chat Logs uploaded successfully.");
         }
       });
     }
   };
 
   const startAnalysis = async () => {
-    if (!botSummary || (csvData.length === 0 && standardLogData.length === 0)) return alert("Please configure bot context and upload chat logs.");
+    if (!botSummary || (csvData.length === 0 && standardLogData.length === 0 && chatLogData.length === 0)) return alert("Please configure bot context and upload chat logs.");
     setLoading(true);
     try {
       const result = await analyzeConversations(
@@ -163,7 +193,8 @@ const App: React.FC = () => {
         selectedModel,
         geminiApiKey,
         openaiApiKey,
-        standardLogData
+        standardLogData,
+        chatLogData
       );
       setAnalysisResult(result);
       setViewMode('dashboard');
@@ -281,7 +312,9 @@ const App: React.FC = () => {
 
     const auditHeader = analysisResult.categorizedRows[0]?.CALL_ID
       ? ["Pillar", "Outcome", "Topic", "Call ID", "Duration", "Conversation Summary", "User Summary", "Recording"]
-      : ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
+      : analysisResult.categorizedRows[0]?.['Session Id']
+        ? ["Pillar", "Outcome", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"]
+        : ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
 
     const auditRows = analysisResult.categorizedRows.map((r: any) => {
       const bucketName = r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : r.BUCKET === '3' ? 'GAPS' : 'RESOLVED';
@@ -296,6 +329,23 @@ const App: React.FC = () => {
           r.CONVERSATION_SUMMARY,
           r.USER_SUMMARY,
           r.RECORDING_URL ? { f: `HYPERLINK("${r.RECORDING_URL}", "Open Recording")` } : "--"
+        ];
+      }
+
+      if (r['Session Id']) {
+        return [
+          bucketName,
+          r.RESOLUTION_STATUS,
+          r.TOPIC,
+          r['Session Id'],
+          r['Created Date'],
+          r['Journey:Step'],
+          r['Source'],
+          r['Interaction medium'],
+          r['Language'],
+          r['Message'],
+          r['Translated message'],
+          r['Feedback']
         ];
       }
 
@@ -418,15 +468,21 @@ const App: React.FC = () => {
               <div className="p-8 bg-emerald-50/50 border border-emerald-100 rounded-[2.5rem] flex flex-col">
                 <h3 className="text-xs font-black text-emerald-900 uppercase tracking-widest mb-6">2. Performance Transcripts (CSV)</h3>
 
-                <div className="grid grid-cols-1 gap-4 flex-1">
-                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[2rem] p-6 relative hover:bg-white transition-all group">
-                    <i className={`fas ${standardLogData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-list text-emerald-300'} text-3xl mb-3 group-hover:scale-110 transition duration-300`}></i>
-                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{standardLogData.length > 0 ? `${standardLogData.length} records` : 'Standard Log'}</p>
+                <div className="grid grid-cols-1 gap-3 flex-1">
+                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[1.5rem] p-4 relative hover:bg-white transition-all group">
+                    <i className={`fas ${standardLogData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-list text-emerald-300'} text-2xl mb-2 group-hover:scale-110 transition duration-300`}></i>
+                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{standardLogData.length > 0 ? `${standardLogData.length} records` : 'Voice Logs'}</p>
                     <input type="file" accept=".csv" onChange={handleStandardLogUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
                   </div>
 
-                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[2rem] p-6 relative hover:bg-white transition-all group">
-                    <i className={`fas ${csvData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-database text-emerald-300'} text-3xl mb-3 group-hover:scale-110 transition duration-300`}></i>
+                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[1.5rem] p-4 relative hover:bg-white transition-all group">
+                    <i className={`fas ${chatLogData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-comments text-emerald-300'} text-2xl mb-2 group-hover:scale-110 transition duration-300`}></i>
+                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{chatLogData.length > 0 ? `${chatLogData.length} records` : 'Chat Logs'}</p>
+                    <input type="file" accept=".csv" onChange={handleChatLogUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
+                  </div>
+
+                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[1.5rem] p-4 relative hover:bg-white transition-all group">
+                    <i className={`fas ${csvData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-database text-emerald-300'} text-2xl mb-2 group-hover:scale-110 transition duration-300`}></i>
                     <p className="text-[10px] font-black uppercase text-slate-400 text-center">{csvData.length > 0 ? `${csvData.length} records` : 'CRA Data'}</p>
                     <input type="file" accept=".csv" onChange={handleCsvUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
                   </div>
@@ -455,7 +511,7 @@ const App: React.FC = () => {
 
 
             </div>
-            <button onClick={startAnalysis} disabled={loading || !botSummary || (csvData.length === 0 && standardLogData.length === 0)} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? 'Processing...' : 'Analyze Performance'}</button>
+            <button onClick={startAnalysis} disabled={loading || !botSummary || (csvData.length === 0 && standardLogData.length === 0 && chatLogData.length === 0)} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? 'Processing...' : 'Analyze Performance'}</button>
           </div>
         )}
 
@@ -568,7 +624,7 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
             <th className="p-8 w-[150px]">Pillar</th>
             <th className="p-8 w-[160px]">Outcome</th>
             <th className="p-8 w-[180px]">Topic</th>
-            <th className="p-8">{filteredRows[0]?.CALL_ID ? 'Conversation Summary' : 'Query'}</th>
+            <th className="p-8">{filteredRows[0]?.CALL_ID ? 'Conversation Summary' : (filteredRows[0]?.['Session Id'] ? 'Chat Log' : 'Query')}</th>
             <th className="p-8 w-[100px]">{filteredRows[0]?.CALL_ID ? 'Recording' : 'Audit'}</th>
           </tr>
         </thead>
@@ -591,6 +647,19 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
                     </div>
                     <p>{r.CONVERSATION_SUMMARY}</p>
                     {r.USER_SUMMARY && <p className="text-[10px] text-slate-500 italic">User: {r.USER_SUMMARY}</p>}
+                  </div>
+                ) : r['Session Id'] ? (
+                  <div className="space-y-2">
+                    <div className="flex gap-2 flex-wrap">
+                      <span className="bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded text-[8px] font-black uppercase">Session: {r['Session Id']}</span>
+                      <span className="bg-slate-100 px-2 py-0.5 rounded text-[8px] font-black uppercase text-slate-500">Last Step: {r.LAST_STEP || r['Journey:Step']}</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed">{r.MESSAGE_AGGREGATE || r.USER_QUERY}</p>
+                    <div className="flex gap-2">
+                      <span className="text-[8px] font-bold text-slate-400 uppercase">Lang: {r['Language']}</span>
+                      <span className="text-[8px] font-bold text-slate-400 uppercase">Medium: {r['Interaction medium']}</span>
+                      <span className="text-[8px] font-bold text-slate-400 uppercase">Source: {r['Source']}</span>
+                    </div>
                   </div>
                 ) : r.USER_QUERY}
               </td>

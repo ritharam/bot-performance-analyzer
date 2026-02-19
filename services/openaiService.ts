@@ -21,18 +21,62 @@ export const analyzeWithOpenAI = async (
     goals: string,
     model: ModelOption = 'gpt-4o-mini',
     apiKey?: string,
-    standardLogData?: any[]
+    standardLogData?: any[],
+    chatLogData?: any[]
 ): Promise<AnalysisResult> => {
     const activeApiKey = apiKey || process.env.OPENAI_BEARER_TOKEN;
     const MAX_RECORDS = 100;
 
-    // Choose which data to process. If csvData is empty, use standardLogData.
+    // Priority: csvData > standardLogData > chatLogData
     const isStandardLog = csvData.length === 0 && standardLogData && standardLogData.length > 0;
-    const processData = isStandardLog ? standardLogData!.slice(0, MAX_RECORDS) : csvData.slice(0, MAX_RECORDS);
+    const isChatLog = csvData.length === 0 && (!standardLogData || standardLogData.length === 0) && chatLogData && chatLogData.length > 0;
+
+    // For Chat Logs: group individual messages by Session Id into conversations
+    let groupedChatSessions: any[] = [];
+    if (isChatLog && chatLogData) {
+        const sessionMap = new Map<string, any[]>();
+        chatLogData.forEach(row => {
+            const sid = row['Session Id'] || 'unknown';
+            if (!sessionMap.has(sid)) sessionMap.set(sid, []);
+            sessionMap.get(sid)!.push(row);
+        });
+        groupedChatSessions = Array.from(sessionMap.entries()).map(([sid, rows]) => {
+            const firstRow = rows[0];
+            const userMessages = rows
+                .filter((r: any) => r['Message Type'] === 'USER' || r['Message Type'] === 'user')
+                .map((r: any) => r['Translated message'] || r['Message'])
+                .filter(Boolean)
+                .slice(0, 5)
+                .join(' | ');
+            const allMessages = rows
+                .map((r: any) => r['Translated message'] || r['Message'])
+                .filter(Boolean)
+                .slice(0, 8)
+                .join(' | ');
+            const feedback = rows.map((r: any) => r['Feedback']).filter(Boolean).pop() || 'N/A';
+            const lastStep = rows.map((r: any) => r['Journey:Step']).filter(Boolean).pop() || 'N/A';
+            return {
+                ...firstRow,
+                'Session Id': sid,
+                'MESSAGE_AGGREGATE': userMessages || allMessages || 'N/A',
+                'FEEDBACK_AGGREGATE': feedback,
+                'LAST_STEP': lastStep,
+                'SOURCE_ROWS': rows
+            };
+        });
+    }
+
+    const processData = isStandardLog
+        ? standardLogData!.slice(0, MAX_RECORDS)
+        : isChatLog
+            ? groupedChatSessions.slice(0, MAX_RECORDS)
+            : csvData.slice(0, MAX_RECORDS);
 
     const dataPrompt = isStandardLog
         ? JSON.stringify(processData.map((r, i) => ({ i, q: r.CONVERSATION_SUMMARY || r.USER_SUMMARY || "N/A", s: r.HANGUP_REASON || "N/A", t: "N/A" })))
-        : JSON.stringify(processData.map((r, i) => ({ i, q: r.USER_QUERY, s: r.RESOLUTION_STATUS, t: r.TOPIC })));
+        : isChatLog
+            ? JSON.stringify(processData.map((r, i) => ({ i, q: r.MESSAGE_AGGREGATE || "N/A", s: r.FEEDBACK_AGGREGATE || "N/A", t: r.LAST_STEP || "N/A" })))
+            : JSON.stringify(processData.map((r, i) => ({ i, q: r.USER_QUERY, s: r.RESOLUTION_STATUS, t: r.TOPIC })));
 
     const prompt = `Act as a senior Chatbot Performance Strategist for Royal Enfield. 
   
@@ -107,12 +151,22 @@ export const analyzeWithOpenAI = async (
                 BUCKET_LABEL: 'Resolved / Out of Scope',
                 APPROVAL_STATUS: 'Pending' as const
             }))
-            : csvData.map(row => ({
-                ...row,
-                BUCKET: '0',
-                BUCKET_LABEL: 'Resolved / Out of Scope',
-                APPROVAL_STATUS: 'Pending' as const
-            }));
+            : isChatLog
+                ? groupedChatSessions.map(row => ({
+                    ...row,
+                    USER_QUERY: row.MESSAGE_AGGREGATE || 'N/A',
+                    RESOLUTION_STATUS: row.FEEDBACK_AGGREGATE || 'N/A',
+                    TOPIC: row.LAST_STEP || 'N/A',
+                    BUCKET: '0',
+                    BUCKET_LABEL: 'Resolved / Out of Scope',
+                    APPROVAL_STATUS: 'Pending' as const
+                }))
+                : csvData.map(row => ({
+                    ...row,
+                    BUCKET: '0',
+                    BUCKET_LABEL: 'Resolved / Out of Scope',
+                    APPROVAL_STATUS: 'Pending' as const
+                }));
 
         // Function to process buckets and assign indices to rows (same as Gemini)
         const processBucket = (recs: any[], bucketId: string, label: string) => {
