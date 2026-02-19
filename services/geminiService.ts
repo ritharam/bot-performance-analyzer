@@ -17,12 +17,20 @@ export const analyzeWithGemini = async (
   csvData: ConversationRow[],
   botSummary: string,
   goals: string,
-  apiKey?: string
+  apiKey?: string,
+  standardLogData?: any[]
 ): Promise<AnalysisResult> => {
   const activeApiKey = apiKey || process.env.GEMINI_API_KEY;
   const ai = new GoogleGenAI({ apiKey: activeApiKey || "" });
   const MAX_RECORDS = 100; // Increased limit for better breadth
-  const processData = csvData.slice(0, MAX_RECORDS);
+
+  // Choose which data to process. If csvData is empty, use standardLogData.
+  const isStandardLog = csvData.length === 0 && standardLogData && standardLogData.length > 0;
+  const processData = isStandardLog ? standardLogData!.slice(0, MAX_RECORDS) : csvData.slice(0, MAX_RECORDS);
+
+  const dataPrompt = isStandardLog
+    ? JSON.stringify(processData.map((r, i) => ({ i, q: r.CONVERSATION_SUMMARY || r.USER_SUMMARY || "N/A", s: r.HANGUP_REASON || "N/A", t: "N/A" })))
+    : JSON.stringify(processData.map((r, i) => ({ i, q: r.USER_QUERY, s: r.RESOLUTION_STATUS, t: r.TOPIC })));
 
   const prompt = `Act as a senior Chatbot Performance Strategist for Royal Enfield. 
   
@@ -33,7 +41,7 @@ export const analyzeWithGemini = async (
   ${botSummary.slice(0, 8000)}
 
   CONVERSATION DATA (Indices 0 to ${processData.length - 1}):
-  ${JSON.stringify(processData.map((r, i) => ({ i, q: r.USER_QUERY, s: r.RESOLUTION_STATUS, t: r.TOPIC })))}
+  ${dataPrompt}
 
   TASK:
   1. Identify recurring clusters of failures and categorize them into:
@@ -73,12 +81,21 @@ export const analyzeWithGemini = async (
     const parsed = safeJsonParse<any>(response.text, { bucket1: [], bucket2: [], bucket3: [] });
 
     // Initialize rows with default bucket '0'
-    const categorizedRows = csvData.map(row => ({
-      ...row,
-      BUCKET: '0',
-      BUCKET_LABEL: 'Resolved / Out of Scope',
-      APPROVAL_STATUS: 'Pending' as const
-    }));
+    const categorizedRows = isStandardLog
+      ? standardLogData!.map(row => ({
+        ...row,
+        USER_QUERY: row.CONVERSATION_SUMMARY || row.USER_SUMMARY || 'N/A',
+        RESOLUTION_STATUS: row.HANGUP_REASON || 'N/A',
+        BUCKET: '0',
+        BUCKET_LABEL: 'Resolved / Out of Scope',
+        APPROVAL_STATUS: 'Pending' as const
+      }))
+      : csvData.map(row => ({
+        ...row,
+        BUCKET: '0',
+        BUCKET_LABEL: 'Resolved / Out of Scope',
+        APPROVAL_STATUS: 'Pending' as const
+      }));
 
     // Function to process buckets and assign indices to rows
     const processBucket = (recs: any[], bucketId: string, label: string) => {

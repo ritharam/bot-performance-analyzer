@@ -16,6 +16,17 @@ export interface ConversationRow {
   APPROVAL_STATUS: 'Yes' | 'No' | 'Pending';
 }
 
+export interface StandardLogRow {
+  CALL_ID: string;
+  CALL_DURATION: string;
+  HANGUP_REASON: string;
+  HANGUP_SOURCE: string;
+  RECORDING_URL: string;
+  CONVERSATION_SUMMARY: string;
+  USER_SUMMARY: string;
+  BOT_SUMMARY: string;
+}
+
 export interface BucketRecommendation {
   topic: string;
   count: number;

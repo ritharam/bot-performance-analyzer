@@ -20,6 +20,7 @@ const App: React.FC = () => {
   const [geminiApiKey, setGeminiApiKey] = useState('');
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [csvData, setCsvData] = useState<ConversationRow[]>([]);
+  const [standardLogData, setStandardLogData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [rawBotJson, setRawBotJson] = useState<any>(null);
   const [botSummary, setBotSummary] = useState<string | null>(null);
@@ -77,6 +78,20 @@ const App: React.FC = () => {
     }
   };
 
+  const handleSummaryUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const content = event.target?.result as string;
+        setBotSummary(content);
+        setRawBotJson(null); // Clear JSON if summary is uploaded directly
+        alert("Summary file uploaded successfully.");
+      };
+      reader.readAsText(file);
+    }
+  };
+
   const downloadSummaryTxt = () => {
     if (!botSummary) return;
     const element = document.createElement("a");
@@ -113,8 +128,32 @@ const App: React.FC = () => {
     }
   };
 
+  const handleStandardLogUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: (results) => {
+          const rows = results.data as any[];
+          setStandardLogData(rows.map((r) => ({
+            CALL_ID: r.CALL_ID || '',
+            CALL_DURATION: r.CALL_DURATION || '',
+            HANGUP_REASON: r.HANGUP_REASON || '',
+            HANGUP_SOURCE: r.HANGUP_SOURCE || '',
+            RECORDING_URL: r.RECORDING_URL || '',
+            CONVERSATION_SUMMARY: r.CONVERSATION_SUMMARY || '',
+            USER_SUMMARY: r.USER_SUMMARY || '',
+            BOT_SUMMARY: r.BOT_SUMMARY || ''
+          })));
+          alert("Standard Log uploaded successfully.");
+        }
+      });
+    }
+  };
+
   const startAnalysis = async () => {
-    if (!botSummary || csvData.length === 0) return alert("Please configure bot context and upload chat logs.");
+    if (!botSummary || (csvData.length === 0 && standardLogData.length === 0)) return alert("Please configure bot context and upload chat logs.");
     setLoading(true);
     try {
       const result = await analyzeConversations(
@@ -123,7 +162,8 @@ const App: React.FC = () => {
         goals,
         selectedModel,
         geminiApiKey,
-        openaiApiKey
+        openaiApiKey,
+        standardLogData
       );
       setAnalysisResult(result);
       setViewMode('dashboard');
@@ -186,7 +226,7 @@ const App: React.FC = () => {
         pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, pdfHeight);
         heightLeft -= pageHeight;
       }
-      pdf.save(`${botTitle || botId || 'Strategic_Audit'}.pdf`);
+      pdf.save(`${botTitle || botId || 'Audit_Report'}.pdf`);
     } catch (err) { alert("PDF generation failed."); } finally { setLoading(false); }
   };
 
@@ -239,9 +279,25 @@ const App: React.FC = () => {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(formatRecommendations(analysisResult.recommendations.bucket2)), "2-Optimization");
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(formatRecommendations(analysisResult.recommendations.bucket3)), "3-KnowledgeGaps");
 
-    const auditHeader = ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
+    const auditHeader = analysisResult.categorizedRows[0]?.CALL_ID
+      ? ["Pillar", "Outcome", "Topic", "Call ID", "Duration", "Conversation Summary", "User Summary", "Recording"]
+      : ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
+
     const auditRows = analysisResult.categorizedRows.map((r: any) => {
       const bucketName = r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : r.BUCKET === '3' ? 'GAPS' : 'RESOLVED';
+
+      if (r.CALL_ID) {
+        return [
+          bucketName,
+          r.RESOLUTION_STATUS,
+          r.TOPIC,
+          r.CALL_ID,
+          r.CALL_DURATION,
+          r.CONVERSATION_SUMMARY,
+          r.USER_SUMMARY,
+          r.RECORDING_URL ? { f: `HYPERLINK("${r.RECORDING_URL}", "Open Recording")` } : "--"
+        ];
+      }
 
       const rowData = [
         bucketName,
@@ -257,7 +313,7 @@ const App: React.FC = () => {
 
     if (reportElement) reportElement.setAttribute('style', originalStyle);
 
-    XLSX.writeFile(wb, `${botTitle || botId || 'Strategic_Audit'}.xlsx`);
+    XLSX.writeFile(wb, `${botTitle || botId || 'Audit_Report'}.xlsx`);
   };
 
   const tabs = [
@@ -317,15 +373,29 @@ const App: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="relative group flex-1 min-h-[140px] mb-6">
-                  <input type="file" accept=".json" onChange={handleManualJsonUpload} className="absolute inset-0 opacity-0 cursor-pointer z-10" />
-                  <div className={`h-full border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all duration-300 ${rawBotJson ? 'bg-indigo-600 border-indigo-600 shadow-lg' : 'border-slate-300 group-hover:bg-white group-hover:border-indigo-400'}`}>
-                    <div className={`h-12 w-12 rounded-full flex items-center justify-center mb-3 ${rawBotJson ? 'bg-white/20' : 'bg-slate-100'}`}>
-                      <i className={`fas ${rawBotJson ? 'fa-check text-white' : 'fa-cloud-upload-alt text-slate-400'} text-xl`}></i>
+                <div className="grid grid-cols-2 gap-4 mb-6">
+                  <div className="relative group min-h-[140px]">
+                    <input type="file" accept=".json" onChange={handleManualJsonUpload} className="absolute inset-0 opacity-0 cursor-pointer z-10" />
+                    <div className={`h-full border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all duration-300 ${rawBotJson ? 'bg-indigo-600 border-indigo-600 shadow-lg' : 'border-slate-300 group-hover:bg-white group-hover:border-indigo-400'}`}>
+                      <div className={`h-12 w-12 rounded-full flex items-center justify-center mb-3 ${rawBotJson ? 'bg-white/20' : 'bg-slate-100'}`}>
+                        <i className={`fas ${rawBotJson ? 'fa-check text-white' : 'fa-file-code text-slate-400'} text-xl`}></i>
+                      </div>
+                      <span className={`text-[10px] font-black uppercase tracking-widest text-center px-4 ${rawBotJson ? 'text-white' : 'text-slate-400'}`}>
+                        {rawBotJson ? (botId ? `Bot: ${botId}` : 'JSON Loaded') : 'Upload JSON'}
+                      </span>
                     </div>
-                    <span className={`text-[10px] font-black uppercase tracking-widest text-center px-4 ${rawBotJson ? 'text-white' : 'text-slate-400'}`}>
-                      {rawBotJson ? (botId ? `Bot ID: ${botId} Loaded` : 'Configuration Loaded') : 'Upload JSON Configuration'}
-                    </span>
+                  </div>
+
+                  <div className="relative group min-h-[140px]">
+                    <input type="file" accept=".txt" onChange={handleSummaryUpload} className="absolute inset-0 opacity-0 cursor-pointer z-10" />
+                    <div className={`h-full border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all duration-300 ${botSummary && !rawBotJson ? 'bg-indigo-600 border-indigo-600 shadow-lg' : 'border-slate-300 group-hover:bg-white group-hover:border-indigo-400'}`}>
+                      <div className={`h-12 w-12 rounded-full flex items-center justify-center mb-3 ${botSummary && !rawBotJson ? 'bg-white/20' : 'bg-slate-100'}`}>
+                        <i className={`fas ${botSummary && !rawBotJson ? 'fa-check text-white' : 'fa-file-alt text-slate-400'} text-xl`}></i>
+                      </div>
+                      <span className={`text-[10px] font-black uppercase tracking-widest text-center px-4 ${botSummary && !rawBotJson ? 'text-white' : 'text-slate-400'}`}>
+                        {botSummary && !rawBotJson ? 'Summary Uploaded' : 'Upload Summary'}
+                      </span>
+                    </div>
                   </div>
                 </div>
 
@@ -342,25 +412,50 @@ const App: React.FC = () => {
                   />
                 </div>
 
-                {botSummary && <button onClick={downloadSummaryTxt} className="w-full bg-slate-900 text-white py-3 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-black transition-all">Download summary.txt</button>}
+                {botSummary && rawBotJson && <button onClick={downloadSummaryTxt} className="w-full bg-slate-900 text-white py-3 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-black transition-all">Download summary.txt</button>}
               </div>
 
               <div className="p-8 bg-emerald-50/50 border border-emerald-100 rounded-[2.5rem] flex flex-col">
-                <h3 className="text-xs font-black text-emerald-900 uppercase tracking-widest mb-6">2. Performance Data</h3>
-                <div className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[2rem] p-8 relative hover:bg-white transition-all group">
-                  <i className={`fas ${csvData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-upload text-emerald-300'} text-4xl mb-4 group-hover:scale-110 transition duration-300`}></i>
-                  <p className="text-[10px] font-black uppercase text-slate-400 text-center">{csvData.length > 0 ? `${csvData.length} records parsed` : 'Drop export.csv here'}</p>
-                  <input type="file" accept=".csv" onChange={handleCsvUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
+                <h3 className="text-xs font-black text-emerald-900 uppercase tracking-widest mb-6">2. Performance Transcripts (CSV)</h3>
+
+                <div className="grid grid-cols-1 gap-4 flex-1">
+                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[2rem] p-6 relative hover:bg-white transition-all group">
+                    <i className={`fas ${standardLogData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-list text-emerald-300'} text-3xl mb-3 group-hover:scale-110 transition duration-300`}></i>
+                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{standardLogData.length > 0 ? `${standardLogData.length} records` : 'Standard Log'}</p>
+                    <input type="file" accept=".csv" onChange={handleStandardLogUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
+                  </div>
+
+                  <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[2rem] p-6 relative hover:bg-white transition-all group">
+                    <i className={`fas ${csvData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-database text-emerald-300'} text-3xl mb-3 group-hover:scale-110 transition duration-300`}></i>
+                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{csvData.length > 0 ? `${csvData.length} records` : 'CRA Data'}</p>
+                    <input type="file" accept=".csv" onChange={handleCsvUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
+                  </div>
                 </div>
+
+                <p className="text-[9px] font-bold text-slate-400 mt-4 text-center uppercase tracking-widest">Select processing format above</p>
               </div>
               <div className="p-8 bg-amber-50/50 border border-amber-100 rounded-[2.5rem] flex flex-col">
                 <h3 className="text-xs font-black text-amber-900 uppercase tracking-widest mb-6">3. Strategic Goals</h3>
-                <textarea value={goals} onChange={(e) => setGoals(e.target.value)} placeholder="What are your goals?" className="flex-1 w-full bg-white border border-slate-200 rounded-[1.5rem] p-6 text-sm resize-none outline-none focus:ring-2 focus:ring-amber-500" />
+                <textarea value={goals} onChange={(e) => setGoals(e.target.value)} placeholder="What are your goals?" className="flex-1 w-full bg-white border border-slate-200 rounded-[1.5rem] p-6 text-sm resize-none outline-none focus:ring-2 focus:ring-amber-500 mb-6" />
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-amber-400 uppercase tracking-widest ml-2">Preferred AI Model</label>
+                  <select
+                    value={selectedModel}
+                    onChange={(e) => setSelectedModel(e.target.value as ModelOption)}
+                    className="w-full bg-white border border-amber-200 rounded-2xl px-5 py-3 text-xs font-bold outline-none focus:ring-2 focus:ring-amber-500 transition-all shadow-sm"
+                  >
+                    <option value="gpt-4.1">GPT-4.1 (Standard)</option>
+                    <option value="gpt-4o">GPT-4o (Advanced)</option>
+                    <option value="gpt-4o-mini">GPT-4o Mini (Fast)</option>
+                    <option value="gemini-flash">Gemini 1.5 Flash (Balanced)</option>
+                  </select>
+                </div>
               </div>
 
 
             </div>
-            <button onClick={startAnalysis} disabled={loading || !botSummary || csvData.length === 0} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? 'Processing...' : 'Analyze Performance'}</button>
+            <button onClick={startAnalysis} disabled={loading || !botSummary || (csvData.length === 0 && standardLogData.length === 0)} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? 'Processing...' : 'Analyze Performance'}</button>
           </div>
         )}
 
@@ -382,10 +477,10 @@ const App: React.FC = () => {
             <div className="flex justify-between items-center border-b-4 border-slate-900 pb-4 mb-8">
               <div>
                 <h1 className="text-3xl font-black uppercase text-slate-900 tracking-tighter">
-                  {botTitle ? `${botTitle} - Strategic Audit` : 'Strategic Performance Audit'}
+                  {botTitle || 'Performance Audit'}
                 </h1>
                 <p className="text-slate-500 font-bold text-xs uppercase tracking-widest">
-                  {botTitle || 'Royal Enfield Bot'} | RE-{botId || 'Default'}
+                  {botTitle || 'Bot Agent'} | {botId || 'N/A'}
                 </p>
               </div>
               <div className="text-right"><p className="text-[9px] font-black uppercase text-slate-400">Analysis Date</p><p className="text-sm font-bold">{new Date().toLocaleDateString()}</p></div>
@@ -466,7 +561,51 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
       <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Outcome</label><select value={filterOutcome} onChange={(e) => setFilterOutcome(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Outcomes</option>{uniqueFilters.outcomes.map((o: any) => <option key={o} value={o}>{o}</option>)}</select></div>
       <div className="space-y-3"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Topic Cluster</label><select value={filterTopic} onChange={(e) => setFilterTopic(e.target.value)} className="w-full bg-white border-2 rounded-2xl px-5 py-4 text-xs font-black shadow-sm outline-none focus:ring-2 focus:ring-indigo-500"><option value="">All Topics</option>{uniqueFilters.topics.map((t: any) => <option key={t} value={t}>{t}</option>)}</select></div>
     </div>
-    <div className="overflow-x-auto"><table className="w-full text-left text-xs table-fixed"><thead className="border-b-4 border-slate-100 uppercase text-slate-400 font-black tracking-widest"><tr><th className="p-8 w-[150px]">Pillar</th><th className="p-8 w-[160px]">Outcome</th><th className="p-8 w-[180px]">Topic</th><th className="p-8">Query</th><th className="p-8 w-[100px]">Audit</th></tr></thead><tbody className="divide-y divide-slate-50">{filteredRows.map((r: any, i: number) => (<tr key={i} className="hover:bg-slate-50 transition-colors"><td className="p-8 align-top"><span className={`px-4 py-2 rounded-xl font-black text-[9px] uppercase tracking-widest ${r.BUCKET === '1' ? 'bg-rose-100 text-rose-700' : r.BUCKET === '2' ? 'bg-amber-100 text-amber-700' : r.BUCKET === '3' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'}`}>{r.BUCKET === '0' ? 'RESOLVED' : r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : 'GAPS'}</span></td><td className="p-8 font-black text-slate-700 align-top">{r.RESOLUTION_STATUS}</td><td className="p-8 font-bold text-slate-400 uppercase tracking-tighter align-top break-words">{r.TOPIC}</td><td className="p-8 font-medium text-slate-900 leading-relaxed align-top break-words">{r.USER_QUERY}</td><td className="p-8 align-top">{r.CHATURL ? <a href={r.CHATURL} target="_blank" className="text-indigo-600 font-black hover:text-indigo-900">Link</a> : "--"}</td></tr>))}</tbody></table></div>
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-xs table-fixed">
+        <thead className="border-b-4 border-slate-100 uppercase text-slate-400 font-black tracking-widest">
+          <tr>
+            <th className="p-8 w-[150px]">Pillar</th>
+            <th className="p-8 w-[160px]">Outcome</th>
+            <th className="p-8 w-[180px]">Topic</th>
+            <th className="p-8">{filteredRows[0]?.CALL_ID ? 'Conversation Summary' : 'Query'}</th>
+            <th className="p-8 w-[100px]">{filteredRows[0]?.CALL_ID ? 'Recording' : 'Audit'}</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-50">
+          {filteredRows.map((r: any, i: number) => (
+            <tr key={i} className="hover:bg-slate-50 transition-colors">
+              <td className="p-8 align-top">
+                <span className={`px-4 py-2 rounded-xl font-black text-[9px] uppercase tracking-widest ${r.BUCKET === '1' ? 'bg-rose-100 text-rose-700' : r.BUCKET === '2' ? 'bg-amber-100 text-amber-700' : r.BUCKET === '3' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'}`}>
+                  {r.BUCKET === '0' ? 'RESOLVED' : r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : 'GAPS'}
+                </span>
+              </td>
+              <td className="p-8 font-black text-slate-700 align-top">{r.RESOLUTION_STATUS}</td>
+              <td className="p-8 font-bold text-slate-400 uppercase tracking-tighter align-top break-words">{r.TOPIC}</td>
+              <td className="p-8 font-medium text-slate-900 leading-relaxed align-top break-words">
+                {r.CALL_ID ? (
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <span className="bg-slate-100 px-2 py-0.5 rounded text-[8px] font-black uppercase text-slate-500">ID: {r.CALL_ID}</span>
+                      <span className="bg-slate-100 px-2 py-0.5 rounded text-[8px] font-black uppercase text-slate-500">Dur: {r.CALL_DURATION}</span>
+                    </div>
+                    <p>{r.CONVERSATION_SUMMARY}</p>
+                    {r.USER_SUMMARY && <p className="text-[10px] text-slate-500 italic">User: {r.USER_SUMMARY}</p>}
+                  </div>
+                ) : r.USER_QUERY}
+              </td>
+              <td className="p-8 align-top">
+                {r.RECORDING_URL || r.CHATURL ? (
+                  <a href={r.RECORDING_URL || r.CHATURL} target="_blank" className="text-indigo-600 font-black hover:text-indigo-900">
+                    {r.RECORDING_URL ? 'Audio' : 'Link'}
+                  </a>
+                ) : "--"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   </div>
 );
 
