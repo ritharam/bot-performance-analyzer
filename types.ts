@@ -14,6 +14,9 @@ export interface ConversationRow {
   BUCKET?: string;
   BUCKET_LABEL?: string;
   APPROVAL_STATUS: 'Yes' | 'No' | 'Pending';
+  USER_SUMMARY?: string;
+  BOT_SUMMARY?: string;
+  CONVERSATION_SUMMARY?: string;
 }
 
 export interface StandardLogRow {
@@ -41,6 +44,9 @@ export interface ChatLogRow {
   'Feedback': string;
   'Language': string;
   'Translated message': string;
+  'User_Summary'?: string;
+  'Bot_Summary'?: string;
+  'Conversation_Summary'?: string;
 }
 
 export interface BucketRecommendation {
@@ -62,10 +68,79 @@ export interface AnalysisResult {
     bucket2: BucketRecommendation[];
     bucket3: BucketRecommendation[];
   };
+  clusterSummaries?: ClusterSummary[];
+  totalRowsProcessed?: number;
+  analysisLog?: AnalysisLog;
 }
 
 export interface AnalysisSummary {
   totalChats: number;
   statusBreakdown: Record<string, number>;
   bucketDistribution: Record<string, number>;
+}
+
+export interface ClusterSummary {
+  topic: string;
+  total: number;
+  unresolved: number;
+  resolution_attempted: number;
+  partially_resolved: number;
+  user_drop_off: number;
+  positive_sentiment: number;
+  neutral_sentiment: number;
+  negative_sentiment: number;
+  failure_rate: number;
+  negative_rate: number;
+  sample_queries: string[];
+  row_indices: number[];
+}
+
+export interface BatchAnalysisProgress {
+  currentBatch: number;
+  totalBatches: number;
+  stage: 'clustering' | 'strategic' | 'detail' | 'merging' | 'done';
+  message: string;
+}
+
+export interface AnalysisLog {
+  runId: string;
+  startTime: string;
+  endTime?: string;
+  model: string;
+  botTitle: string;
+  csvTotalRows: number;
+  csvAfterFilter: number;
+  csvFilteredOut: number;
+  filterStatuses: string[];
+  totalClustersGenerated: number;
+  topClustersSelected: number;
+  clustersDropped: number;
+  clusterDetails: {
+    rank: number;
+    topic: string;
+    total: number;
+    failure_rate: number;
+    negative_rate: number;
+    sentToAI: boolean;
+  }[];
+  batchSummary: {
+    batchName: string;
+    inputSize: number;
+    tokenEstimate: number;
+    durationMs: number;
+    success: boolean;
+    errorMessage?: string;
+  }[];
+  topicAssignmentsReturned: number;
+  topicAssignmentsMapped: number;
+  topicAssignmentsUnmatched: number;
+  bucket0Count: number;
+  bucket1Count: number;
+  bucket2Count: number;
+  bucket3Count: number;
+  recommendationsGenerated: number;
+  rowsAccountedFor: number;
+  dataLossRows: number;
+  dataLossTopics: string[];
+  errors: string[];
 }

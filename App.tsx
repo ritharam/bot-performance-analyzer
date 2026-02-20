@@ -2,9 +2,10 @@ import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
-import { analyzeConversations } from './services/aiService';
+import { exportLogAsMarkdown } from './services/analysisLogger';
+import { analyzeConversations, analyzeConversationsWithBatching } from './services/aiService';
 import { generateBotSummary } from './services/botProcessor';
-import { ConversationRow, AnalysisSummary, AnalysisResult, BucketRecommendation, ModelOption } from './types';
+import { ConversationRow, AnalysisSummary, AnalysisResult, BucketRecommendation, ModelOption, BatchAnalysisProgress } from './types';
 
 // Access globally loaded PDF libraries
 declare const html2canvas: any;
@@ -28,11 +29,16 @@ const App: React.FC = () => {
   const [analysisResult, setAnalysisResult] = useState<any>(null);
   const [selectedModel, setSelectedModel] = useState<ModelOption>('gpt-4.1');
   const [activeTab, setActiveTab] = useState<'summary' | 'bucket1' | 'bucket2' | 'bucket3' | 'raw'>('summary');
+  const [analysisProgress, setAnalysisProgress] = useState<BatchAnalysisProgress | null>(null);
+  const [errorState, setErrorState] = useState<{ title: string; message: string; suggestion?: string } | null>(null);
+  const [csvStats, setCsvStats] = useState<{ total: number; filteredOut: number; filterStatuses: string[] } | null>(null);
 
   // Filter States for Raw Data
   const [filterCluster, setFilterCluster] = useState<string>('');
   const [filterOutcome, setFilterOutcome] = useState<string>('');
   const [filterTopic, setFilterTopic] = useState<string>('');
+  const [csvLoadMessage, setCsvLoadMessage] = useState<string>('');
+  const [chatLogSessionCount, setChatLogSessionCount] = useState<number>(0);
 
   useEffect(() => {
     setFilterCluster('');
@@ -112,7 +118,9 @@ const App: React.FC = () => {
         skipEmptyLines: true,
         complete: (results) => {
           const rows = results.data as any[];
-          setCsvData(rows.map((r) => ({
+          const totalCount = rows.length;
+          const allowedStatuses = new Set(['unresolved', 'partially_resolved', 'resolution_attempted', 'user_drop_off']);
+          const mapped = rows.map((r) => ({
             CHATURL: r.CHATURL || '',
             TOPIC: r.TOPIC || '',
             USER_QUERY: r.USER_QUERY || '',
@@ -122,8 +130,16 @@ const App: React.FC = () => {
             TIME_STAMP: r.TIME_STAMP || '',
             USER_ID: r.USER_ID || '',
             USER_SENTIMENT: r.USER_SENTIMENT || '',
-            APPROVAL_STATUS: 'Pending'
-          })));
+            APPROVAL_STATUS: 'Pending' as 'Pending' | 'Yes' | 'No'
+          }));
+          const filtered = mapped.filter((r) => allowedStatuses.has((r.RESOLUTION_STATUS || '').toLowerCase().trim()));
+          setCsvData(filtered);
+          setCsvStats({
+            total: totalCount,
+            filteredOut: totalCount - filtered.length,
+            filterStatuses: Array.from(allowedStatuses)
+          });
+          setCsvLoadMessage(`${filtered.length} of ${totalCount} rows loaded (resolved conversations excluded)`);
         }
       });
     }
@@ -161,7 +177,7 @@ const App: React.FC = () => {
         skipEmptyLines: true,
         complete: (results) => {
           const rows = results.data as any[];
-          setChatLogData(rows.map((r) => ({
+          const mapped = rows.map((r) => ({
             'Created Date': r['Created Date'] || '',
             'Bot Id': r['Bot Id'] || '',
             'UID': r['UID'] || '',
@@ -174,9 +190,16 @@ const App: React.FC = () => {
             'Node type': r['Node type'] || '',
             'Feedback': r['Feedback'] || '',
             'Language': r['Language'] || '',
-            'Translated message': r['Translated message'] || ''
-          })));
-          alert("Chat Logs uploaded successfully.");
+            'Translated message': r['Translated message'] || '',
+            'User_Summary': r['User_Summary'] || '',
+            'Bot_Summary': r['Bot_Summary'] || '',
+            'Conversation_Summary': r['Conversation_Summary'] || ''
+          }));
+          setChatLogData(mapped);
+          // Count unique sessions for accurate display
+          const uniqueSessions = new Set(mapped.map(r => r['Session Id']).filter(Boolean)).size;
+          setChatLogSessionCount(uniqueSessions);
+          alert(`Chat Logs uploaded: ${rows.length} messages across ${uniqueSessions} sessions.`);
         }
       });
     }
@@ -186,7 +209,7 @@ const App: React.FC = () => {
     if (!botSummary || (csvData.length === 0 && standardLogData.length === 0 && chatLogData.length === 0)) return alert("Please configure bot context and upload chat logs.");
     setLoading(true);
     try {
-      const result = await analyzeConversations(
+      const result = await analyzeConversationsWithBatching(
         csvData,
         botSummary,
         goals,
@@ -194,12 +217,36 @@ const App: React.FC = () => {
         geminiApiKey,
         openaiApiKey,
         standardLogData,
-        chatLogData
+        chatLogData,
+        setAnalysisProgress,
+        botTitle || botId || 'Bot Analysis',
+        csvStats || undefined
       );
       setAnalysisResult(result);
+      if (result.analysisLog) {
+        exportLogAsMarkdown(result.analysisLog);
+      }
+      setAnalysisProgress(null);
       setViewMode('dashboard');
       setActiveTab('summary');
-    } catch (error) { alert(`AI Analysis failed: ${error instanceof Error ? error.message : String(error)}`); } finally { setLoading(false); }
+    } catch (error: any) {
+      const message = error.message || String(error);
+      let title = "Analysis Failed";
+      let suggestion = "Please check your connection and try again.";
+
+      if (message.includes("401") || message.includes("Invalid API Key")) {
+        title = "Authentication Error";
+        suggestion = "Your API Key appears to be invalid or expired. Please check your settings.";
+      } else if (message.includes("429") || message.includes("Quota")) {
+        title = "Usage Limit Exceeded";
+        suggestion = "You've hit the rate limit or quota for your API key. Please wait a moment or check your billing.";
+      } else if (message.includes("500") || message.includes("503")) {
+        title = "AI Service Error";
+        suggestion = "The AI service is experiencing issues. We've already retried, but it's still down. Please try again later.";
+      }
+
+      setErrorState({ title, message, suggestion });
+    } finally { setLoading(false); }
   };
 
   const summary = useMemo<AnalysisSummary>(() => {
@@ -281,6 +328,7 @@ const App: React.FC = () => {
       ["KEY PERFORMANCE INDICATORS"],
       ["Metric", "Value", "Pillar Status"],
       ["Total Chats Analyzed", summary.totalChats, "N/A"],
+      ["Total Rows Processed", analysisResult.totalRowsProcessed || summary.totalChats, "Full Dataset Coverage"],
       ["Service Expansion (Bucket 1)", summary.bucketDistribution['1'], "Critical Growth"],
       ["System Optimization (Bucket 2)", summary.bucketDistribution['2'], "Urgent Fixes"],
       ["Information Gaps (Bucket 3)", summary.bucketDistribution['3'], "Knowledge Updates"],
@@ -313,7 +361,7 @@ const App: React.FC = () => {
     const auditHeader = analysisResult.categorizedRows[0]?.CALL_ID
       ? ["Pillar", "Outcome", "Topic", "Call ID", "Duration", "Conversation Summary", "User Summary", "Recording"]
       : analysisResult.categorizedRows[0]?.['Session Id']
-        ? ["Pillar", "Outcome", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"]
+        ? ["Pillar", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"]
         : ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
 
     const auditRows = analysisResult.categorizedRows.map((r: any) => {
@@ -335,7 +383,6 @@ const App: React.FC = () => {
       if (r['Session Id']) {
         return [
           bucketName,
-          r.RESOLUTION_STATUS,
           r.TOPIC,
           r['Session Id'],
           r['Created Date'],
@@ -477,7 +524,8 @@ const App: React.FC = () => {
 
                   <div className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-200 rounded-[1.5rem] p-4 relative hover:bg-white transition-all group">
                     <i className={`fas ${chatLogData.length > 0 ? 'fa-check-circle text-emerald-500' : 'fa-comments text-emerald-300'} text-2xl mb-2 group-hover:scale-110 transition duration-300`}></i>
-                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{chatLogData.length > 0 ? `${chatLogData.length} records` : 'Chat Logs'}</p>
+                    <p className="text-[10px] font-black uppercase text-slate-400 text-center">{chatLogData.length > 0 ? `${chatLogSessionCount} sessions` : 'Chat Logs'}</p>
+                    {chatLogData.length > 0 && <p className="text-[8px] text-slate-300 text-center">{chatLogData.length} messages</p>}
                     <input type="file" accept=".csv" onChange={handleChatLogUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
                   </div>
 
@@ -486,6 +534,9 @@ const App: React.FC = () => {
                     <p className="text-[10px] font-black uppercase text-slate-400 text-center">{csvData.length > 0 ? `${csvData.length} records` : 'CRA Data'}</p>
                     <input type="file" accept=".csv" onChange={handleCsvUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
                   </div>
+                  {csvLoadMessage && (
+                    <p className="text-[9px] font-medium text-slate-400 text-center mt-1 px-1 leading-tight">{csvLoadMessage}</p>
+                  )}
                 </div>
 
                 <p className="text-[9px] font-bold text-slate-400 mt-4 text-center uppercase tracking-widest">Select processing format above</p>
@@ -511,7 +562,7 @@ const App: React.FC = () => {
 
 
             </div>
-            <button onClick={startAnalysis} disabled={loading || !botSummary || (csvData.length === 0 && standardLogData.length === 0 && chatLogData.length === 0)} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? 'Processing...' : 'Analyze Performance'}</button>
+            <button onClick={startAnalysis} disabled={loading || !botSummary || (csvData.length === 0 && standardLogData.length === 0 && chatLogData.length === 0)} className="w-full bg-slate-900 text-white py-6 rounded-full font-black uppercase text-xl shadow-2xl transition-all hover:bg-black disabled:opacity-30">{loading ? (analysisProgress ? `[${analysisProgress.currentBatch}/${analysisProgress.totalBatches}] ${analysisProgress.message}` : 'Processing...') : 'Analyze Performance'}</button>
           </div>
         )}
 
@@ -550,6 +601,8 @@ const App: React.FC = () => {
           </div>
         )}
       </main>
+
+      {errorState && <ErrorModal error={errorState} onClose={() => setErrorState(null)} />}
     </div>
   );
 };
@@ -562,6 +615,25 @@ const SummaryView: React.FC<{ summary: AnalysisSummary; isReport?: boolean }> = 
       <KpiCard title="Fixes" value={summary.bucketDistribution['2']} icon="fa-sliders" color="amber" isReport={isReport} />
       <KpiCard title="KB Gaps" value={summary.bucketDistribution['3']} icon="fa-database" color="emerald" isReport={isReport} />
     </div>
+    {isReport && (
+      <div className="border border-slate-200 rounded-lg p-3 bg-slate-50">
+        <p className="text-[7px] font-black uppercase tracking-widest text-slate-400 mb-2">Legend — Strategic Pillars</p>
+        <div className="space-y-1.5">
+          <div className="flex items-start gap-2">
+            <span className="h-2 w-2 rounded-full bg-rose-500 mt-0.5 shrink-0"></span>
+            <p className="text-[7px] font-bold text-slate-600 leading-tight"><span className="text-rose-600 uppercase">Service Expansion</span> — Add a new intent or agent to handle queries the bot currently cannot address.</p>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="h-2 w-2 rounded-full bg-amber-500 mt-0.5 shrink-0"></span>
+            <p className="text-[7px] font-bold text-slate-600 leading-tight"><span className="text-amber-600 uppercase">System Optimization</span> — Improve the logic, flow, or responses of an existing agent that is broken or incomplete.</p>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="h-2 w-2 rounded-full bg-emerald-500 mt-0.5 shrink-0"></span>
+            <p className="text-[7px] font-bold text-slate-600 leading-tight"><span className="text-emerald-600 uppercase">Information Gaps</span> — Add or update resources in the Knowledge Base so the bot can answer correctly.</p>
+          </div>
+        </div>
+      </div>
+    )}
     <div className={`grid ${isReport ? 'grid-cols-1 gap-4' : 'lg:grid-cols-2 gap-16'}`}>
       <div className={`${isReport ? 'p-4' : 'p-12'} border rounded-[1.5rem] bg-slate-50/20`}><h3 className="text-[8px] font-black mb-4 text-center uppercase tracking-widest text-slate-400">Outcomes</h3><div className={`${isReport ? 'h-[150px]' : 'h-[350px]'}`}><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={Object.entries(summary.statusBreakdown).map(([n, v]) => ({ n, v }))} cx="50%" cy="50%" innerRadius={isReport ? 30 : 80} outerRadius={isReport ? 50 : 120} paddingAngle={5} dataKey="v"><Cell fill="#4f46e5" /><Cell fill="#f43f5e" /><Cell fill="#f59e0b" /><Cell fill="#10b981" /><Cell fill="#6366f1" /></Pie>{!isReport && <Tooltip />}{!isReport && <Legend verticalAlign="bottom" />}</PieChart></ResponsiveContainer></div></div>
       {!isReport && (<div className="p-12 border rounded-[2rem] bg-slate-50/20"><h3 className="text-xs font-black mb-10 text-center uppercase tracking-widest text-slate-400">Pillar Mapping</h3><div className="h-[350px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={[{ name: 'Expansion', value: summary.bucketDistribution['1'], fill: '#f43f5e' }, { name: 'Optimization', value: summary.bucketDistribution['2'], fill: '#f59e0b' }, { name: 'Knowledge', value: summary.bucketDistribution['3'], fill: '#10b981' },]}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" /><YAxis /><Tooltip /><Bar dataKey="value" radius={[10, 10, 0, 0]} /></BarChart></ResponsiveContainer></div></div>)}
@@ -622,10 +694,10 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
         <thead className="border-b-4 border-slate-100 uppercase text-slate-400 font-black tracking-widest">
           <tr>
             <th className="p-8 w-[150px]">Pillar</th>
-            <th className="p-8 w-[160px]">Outcome</th>
+            {!filteredRows[0]?.['Session Id'] && <th className="p-8 w-[160px]">Outcome</th>}
             <th className="p-8 w-[180px]">Topic</th>
             <th className="p-8">{filteredRows[0]?.CALL_ID ? 'Conversation Summary' : (filteredRows[0]?.['Session Id'] ? 'Chat Log' : 'Query')}</th>
-            <th className="p-8 w-[100px]">{filteredRows[0]?.CALL_ID ? 'Recording' : 'Audit'}</th>
+            {!filteredRows[0]?.['Session Id'] && <th className="p-8 w-[100px]">{filteredRows[0]?.CALL_ID ? 'Recording' : 'Audit'}</th>}
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-50">
@@ -636,7 +708,7 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
                   {r.BUCKET === '0' ? 'RESOLVED' : r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : 'GAPS'}
                 </span>
               </td>
-              <td className="p-8 font-black text-slate-700 align-top">{r.RESOLUTION_STATUS}</td>
+              {!r['Session Id'] && <td className="p-8 font-black text-slate-700 align-top">{r.RESOLUTION_STATUS}</td>}
               <td className="p-8 font-bold text-slate-400 uppercase tracking-tighter align-top break-words">{r.TOPIC}</td>
               <td className="p-8 font-medium text-slate-900 leading-relaxed align-top break-words">
                 {r.CALL_ID ? (
@@ -652,9 +724,20 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
                   <div className="space-y-2">
                     <div className="flex gap-2 flex-wrap">
                       <span className="bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded text-[8px] font-black uppercase">Session: {r['Session Id']}</span>
-                      <span className="bg-slate-100 px-2 py-0.5 rounded text-[8px] font-black uppercase text-slate-500">Last Step: {r.LAST_STEP || r['Journey:Step']}</span>
+                      {(r.LAST_STEP || r['Journey:Step']) && (r.LAST_STEP !== 'N/A' && r.LAST_STEP !== 'None') && <span className="bg-slate-100 px-2 py-0.5 rounded text-[8px] font-black uppercase text-slate-500">Last Step: {r.LAST_STEP || r['Journey:Step']}</span>}
                     </div>
-                    <p className="text-[11px] leading-relaxed">{r.MESSAGE_AGGREGATE || r.USER_QUERY}</p>
+                    {r.CONVERSATION_SUMMARY ? (
+                      <div className="bg-indigo-50/50 p-2 rounded-lg border border-indigo-100">
+                        <p className="text-[10px] font-bold text-indigo-900 mb-1">Summary</p>
+                        <p className="text-[10px] leading-relaxed text-slate-700">{r.CONVERSATION_SUMMARY}</p>
+                        <div className="mt-2 grid grid-cols-2 gap-2">
+                          {r.USER_SUMMARY && <div><p className="text-[8px] font-black text-slate-400 uppercase">User Intent</p><p className="text-[9px] text-slate-600 leading-tight">{r.USER_SUMMARY}</p></div>}
+                          {r.BOT_SUMMARY && <div><p className="text-[8px] font-black text-slate-400 uppercase">Bot Execution</p><p className="text-[9px] text-slate-600 leading-tight">{r.BOT_SUMMARY}</p></div>}
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-[11px] leading-relaxed">{r.MESSAGE_AGGREGATE || r.USER_QUERY}</p>
+                    )}
                     <div className="flex gap-2">
                       <span className="text-[8px] font-bold text-slate-400 uppercase">Lang: {r['Language']}</span>
                       <span className="text-[8px] font-bold text-slate-400 uppercase">Medium: {r['Interaction medium']}</span>
@@ -663,13 +746,13 @@ const RawDataView: React.FC<any> = ({ filteredRows, filterCluster, setFilterClus
                   </div>
                 ) : r.USER_QUERY}
               </td>
-              <td className="p-8 align-top">
+              {!r['Session Id'] && <td className="p-8 align-top">
                 {r.RECORDING_URL || r.CHATURL ? (
                   <a href={r.RECORDING_URL || r.CHATURL} target="_blank" className="text-indigo-600 font-black hover:text-indigo-900">
                     {r.RECORDING_URL ? 'Audio' : 'Link'}
                   </a>
                 ) : "--"}
-              </td>
+              </td>}
             </tr>
           ))}
         </tbody>
@@ -682,5 +765,28 @@ const KpiCard: React.FC<{ title: string; value: number; icon: string; color: str
   const colors: Record<string, string> = { indigo: "text-indigo-600 bg-indigo-50 shadow-indigo-100/30", rose: "text-rose-600 bg-rose-50 shadow-rose-100/30", amber: "text-amber-600 bg-amber-50 shadow-amber-100/30", emerald: "text-emerald-600 bg-emerald-50 shadow-emerald-100/30" };
   return (<div className={`bg-white ${isReport ? 'p-3 rounded-lg border' : 'p-12 rounded-[3rem] shadow-xl'} border-slate-100 flex flex-col ${isReport ? 'gap-1' : 'gap-6'} print:border-slate-200`}><div className={`${isReport ? 'h-6 w-6 text-sm rounded-md' : 'h-16 w-16 text-3xl rounded-[1.5rem]'} flex items-center justify-center shadow-inner ${colors[color]}`}><i className={`fas ${icon}`}></i></div><div><p className={`${isReport ? 'text-[6px]' : 'text-[10px]'} font-black text-slate-400 uppercase tracking-widest`}>{title}</p><p className={`${isReport ? 'text-lg' : 'text-6xl'} font-black tracking-tighter`}>{value || 0}</p></div></div>);
 };
+
+const ErrorModal: React.FC<{ error: { title: string; message: string; suggestion?: string }; onClose: () => void }> = ({ error, onClose }) => (
+  <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn">
+    <div className="bg-white rounded-[2rem] shadow-2xl p-8 max-w-md w-full border border-rose-100">
+      <div className="flex items-center gap-4 mb-6">
+        <div className="h-12 w-12 bg-rose-100 rounded-full flex items-center justify-center shrink-0">
+          <i className="fas fa-exclamation-triangle text-rose-600 text-xl"></i>
+        </div>
+        <div>
+          <h3 className="text-lg font-black text-slate-800 uppercase tracking-tight">{error.title}</h3>
+          <p className="text-xs font-bold text-rose-500 uppercase tracking-widest">Action Required</p>
+        </div>
+      </div>
+      <p className="text-sm text-slate-600 font-medium leading-relaxed mb-4">{error.message}</p>
+      {error.suggestion && (
+        <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 mb-6">
+          <p className="text-xs text-slate-500 italic"><i className="fas fa-info-circle mr-2 text-indigo-400"></i>{error.suggestion}</p>
+        </div>
+      )}
+      <button onClick={onClose} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold uppercase tracking-widest hover:bg-black transition-colors">Dismiss</button>
+    </div>
+  </div>
+);
 
 export default App;
