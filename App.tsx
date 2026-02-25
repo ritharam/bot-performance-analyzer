@@ -2,7 +2,6 @@ import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
-import { exportLogAsMarkdown } from './services/analysisLogger';
 import { analyzeConversations, analyzeConversationsWithBatching } from './services/aiService';
 import { generateBotSummary } from './services/botProcessor';
 import { ConversationRow, AnalysisSummary, AnalysisResult, BucketRecommendation, ModelOption, BatchAnalysisProgress } from './types';
@@ -223,9 +222,6 @@ const App: React.FC = () => {
         csvStats || undefined
       );
       setAnalysisResult(result);
-      if (result.analysisLog) {
-        exportLogAsMarkdown(result.analysisLog);
-      }
       setAnalysisProgress(null);
       setViewMode('dashboard');
       setActiveTab('summary');

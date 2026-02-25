@@ -52,6 +52,7 @@ export interface ChatLogRow {
 export interface BucketRecommendation {
   topic: string;
   count: number;
+  indices?: number[];
   problemStatement: string;
   rootCause?: string;
   recommendation: string;
@@ -90,6 +91,8 @@ export interface ClusterSummary {
   neutral_sentiment: number;
   negative_sentiment: number;
   failure_rate: number;
+  resolution_rate: number;
+  confidence: number;
   negative_rate: number;
   sample_queries: string[];
   row_indices: number[];
@@ -100,6 +103,13 @@ export interface BatchAnalysisProgress {
   totalBatches: number;
   stage: 'clustering' | 'strategic' | 'detail' | 'merging' | 'done';
   message: string;
+}
+
+export interface ValidationResult {
+  type: 'Index' | 'Bucket' | 'Examples' | 'Quality';
+  status: 'Pass' | 'Fail' | 'Warning';
+  message: string;
+  details?: string;
 }
 
 export interface AnalysisLog {
@@ -142,5 +152,6 @@ export interface AnalysisLog {
   rowsAccountedFor: number;
   dataLossRows: number;
   dataLossTopics: string[];
+  validationResults: ValidationResult[];
   errors: string[];
 }

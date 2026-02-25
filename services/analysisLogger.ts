@@ -26,16 +26,53 @@ export const createLog = (model: string, botTitle: string): AnalysisLog => {
         rowsAccountedFor: 0,
         dataLossRows: 0,
         dataLossTopics: [],
+        validationResults: [],
         errors: []
     };
+};
+
+const HISTORY_KEY = 'bot_analysis_history';
+
+export const saveToHistory = (log: AnalysisLog) => {
+    try {
+        const historyJson = localStorage.getItem(HISTORY_KEY);
+        const history = historyJson ? JSON.parse(historyJson) : [];
+
+        // Store a condensed version of the log for history
+        const historicalEntry = {
+            runId: log.runId,
+            endTime: log.endTime,
+            botTitle: log.botTitle,
+            totalRows: log.csvAfterFilter,
+            bucketDistribution: {
+                b0: log.bucket0Count,
+                b1: log.bucket1Count,
+                b2: log.bucket2Count,
+                b3: log.bucket3Count
+            },
+            recommendations: log.recommendationsGenerated
+        };
+
+        history.push(historicalEntry);
+        // Keep last 50 runs
+        if (history.length > 50) history.shift();
+
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch (e) {
+        console.error('Failed to save to historical tracking:', e);
+    }
 };
 
 export const finaliseLog = (log: AnalysisLog): AnalysisLog => {
     log.endTime = new Date().toISOString();
 
     // Basic sanity calculation for data loss
-    // (In a real scenario, this would be updated throughout the batch process)
     log.dataLossRows = Math.max(0, log.csvAfterFilter - log.rowsAccountedFor);
+
+    // Persist to localStorage for historical comparison
+    if (typeof localStorage !== 'undefined') {
+        saveToHistory(log);
+    }
 
     return log;
 };
@@ -127,6 +164,16 @@ export const exportLogAsMarkdown = (log: AnalysisLog) => {
                 log.dataLossRows,
                 log.dataLossTopics.length > 0 ? log.dataLossTopics.join(", ") : "None"
             ]]
+        },
+        {
+            title: "8. Validation Results",
+            headers: ["Type", "Status", "Message", "Details"],
+            rows: (log.validationResults || []).map(v => [
+                v.type,
+                v.status === 'Pass' ? '✅ Pass' : (v.status === 'Fail' ? '❌ Fail' : '⚠️ Warning'),
+                v.message,
+                v.details || "--"
+            ])
         }
     ];
 

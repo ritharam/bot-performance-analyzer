@@ -66,7 +66,11 @@ export function buildClusterSummaries(rows: ConversationRow[]): ClusterSummary[]
             }
         });
 
-        const failure_rate = total > 0 ? (unresolved + user_drop_off) / total : 0;
+        // Weight definitions: partially=0.5, unresolved=1.0, dropOff=0.8
+        const weighted_unresolved = (unresolved * 1.0) + (partially_resolved * 0.5) + (user_drop_off * 0.8);
+        const failure_rate = total > 0 ? weighted_unresolved / total : 0;
+        const resolution_rate = 1 - failure_rate;
+        const confidence = Math.min(1.0, total / 100); // Higher data = higher confidence
         const negative_rate = total > 0 ? negative_sentiment / total : 0;
 
         // Up to 3 sample queries – prefer unresolved rows first
@@ -88,6 +92,8 @@ export function buildClusterSummaries(rows: ConversationRow[]): ClusterSummary[]
             neutral_sentiment,
             negative_sentiment,
             failure_rate,
+            resolution_rate,
+            confidence,
             negative_rate,
             sample_queries,
             row_indices: indices,

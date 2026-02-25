@@ -1,6 +1,7 @@
 import { ConversationRow, AnalysisResult, BucketRecommendation, ModelOption, BatchAnalysisProgress, AnalysisLog } from '../types';
 import { buildClusterSummaries, getFailureRows, assignBucketsByTopic } from './clusteringService';
 import { createLog, finaliseLog } from './analysisLogger';
+import { runAllValidations } from './validationService';
 
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 
@@ -445,6 +446,10 @@ export async function analyzeWithBatching(
             stage: 'done',
             message: `Analysis complete — ${csvData.length} rows processed.`,
         });
+
+        // ── Stage 5: Validation ───────────────────────────────────────────────────
+        const allRecommendations = [...bucket1, ...bucket2, ...bucket3];
+        log.validationResults = runAllValidations(allRecommendations, categorizedRows, allClusters);
 
         finaliseLog(log);
 
