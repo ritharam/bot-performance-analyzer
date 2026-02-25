@@ -155,11 +155,13 @@ Buckets:
 
 Return valid JSON only:
 {
-  "topic_assignments": [{ "topic": "...", "bucket": "1"|"2"|"3"|"0", "bucket_label": "...", "reason": "..." }],
+  "topic_assignments": [{ "topic": "...", "bucket": "1"|"2"|"3"|"0", "bucket_label": "...", "issue_category": "...", "reason": "..." }],
   "bucket1": [{ "topic": "...", "problemStatement": "...", "recommendation": "...", "rootCause": "...", "goalAlignmentScore": 1-10, "strategicPriority": "Low|Medium|High|Critical", "kpiToWatch": "...", "examples": ["..."] }],
   "bucket2": [...],
   "bucket3": [...]
-}`;
+}
+
+IMPORTANT: In topic_assignments, "issue_category" must exactly match the "topic" field of one of the recs in the assigned bucket (bucket1/bucket2/bucket3). This tells us which Issue Category each cluster belongs to.`;
 }
 
 function buildDetailPrompt(
@@ -324,16 +326,22 @@ export async function analyzeWithBatching(
         // Build topic → bucket/label maps from AI response
         const topicToBucket: Record<string, string> = {};
         const topicToLabel: Record<string, string> = {};
+        // Maps granular cluster topic → the specific Issue Category (rec.topic) within its bucket
+        const topicToIssueCategory: Record<string, string> = {};
 
-        const assignments: Array<{ topic: string; bucket: string; bucket_label?: string; label?: string; reason?: string }> =
+        const assignments: Array<{ topic: string; bucket: string; bucket_label?: string; label?: string; issue_category?: string; reason?: string }> =
             strategicParsed.topic_assignments || [];
 
         log.topicAssignmentsReturned = assignments.length;
 
-        assignments.forEach(({ topic, bucket, bucket_label, label }) => {
+        assignments.forEach(({ topic, bucket, bucket_label, label, issue_category }) => {
             const key = (topic || '').toLowerCase().trim();
             topicToBucket[key] = bucket || '0';
             topicToLabel[key] = bucket_label || label || 'Resolved / Out of Scope';
+            // If the AI provided issue_category, use it directly — most reliable mapping
+            if (issue_category && bucket !== '0') {
+                topicToIssueCategory[key] = issue_category;
+            }
         });
 
         // ── Stage 3: Detail API call ──────────────────────────────────────────────
@@ -424,6 +432,101 @@ export async function analyzeWithBatching(
         const bucket1 = mergeRecommendations(strategicBucket1, detailBucket1);
         const bucket2 = mergeRecommendations(strategicBucket2, detailBucket2);
         const bucket3 = mergeRecommendations(strategicBucket3, detailBucket3);
+
+        // ── Build topicToIssueCategory ─────────────────────────────────────────
+        // Maps each granular cluster topic → the specific rec.topic (Issue Category)
+        // within its bucket. Uses three strategies in order:
+        //   1. Direct index match: if any rec.indices contains rows whose TOPIC = clusterTopic
+        //   2. Keyword similarity: find the rec whose topic shares the most words
+        //   3. Fallback: assign the first (highest-scored) rec in that bucket
+
+        const buildIssueCategoryMap = (
+            bucketRecs: typeof bucket1,
+            bucketId: string,
+            rows: ConversationRow[]
+        ) => {
+            if (!bucketRecs || bucketRecs.length === 0) return;
+
+            // Build a map from rec.topic → set of granular topics covered via rec.indices
+            const recTopicToGranularTopics = new Map<string, Set<string>>();
+            bucketRecs.forEach((rec: any) => {
+                const covered = new Set<string>();
+                if (Array.isArray(rec.indices)) {
+                    rec.indices.forEach((idx: number) => {
+                        const rowTopic = (rows[idx]?.TOPIC || '').toLowerCase().trim();
+                        if (rowTopic) covered.add(rowTopic);
+                    });
+                }
+                recTopicToGranularTopics.set(rec.topic, covered);
+            });
+
+            // For each cluster topic assigned to this bucket, find the best rec.
+            // Skip topics already assigned via AI's issue_category field (most reliable).
+            assignments.forEach(({ topic: clusterTopic, bucket }) => {
+                if (bucket !== bucketId) return;
+                const key = (clusterTopic || '').toLowerCase().trim();
+                if (!key) return;
+                // Already assigned from AI's issue_category — skip
+                if (topicToIssueCategory[key]) return;
+
+                // 1. Direct: a rec's indices covers a row with this exact TOPIC
+                for (const [recTopic, granularSet] of recTopicToGranularTopics) {
+                    if (granularSet.has(key)) {
+                        topicToIssueCategory[key] = recTopic;
+                        return;
+                    }
+                }
+
+                // 2. Keyword similarity between cluster topic and each rec.topic
+                //    Score every word match + substring containment bonus
+                const clusterWords = new Set(key.split(/[\s_\-,]+/).filter((w: string) => w.length > 2));
+                let bestRec = '';
+                let bestScore = -1;
+                bucketRecs.forEach((rec: any) => {
+                    const recLower = (rec.topic || '').toLowerCase();
+                    const recWords = recLower.split(/[\s_\-,]+/).filter((w: string) => w.length > 2);
+                    let score = 0;
+                    recWords.forEach((w: string) => { if (clusterWords.has(w)) score += 2; });
+                    // Substring containment: cluster topic appears inside rec topic name or vice versa
+                    if (recLower.includes(key)) score += 3;
+                    else if (key.includes(recLower.split(' ').slice(0, 2).join(' '))) score += 2;
+                    // Partial word overlap (stem matching)
+                    clusterWords.forEach((cw: string) => {
+                        if (recLower.includes(cw)) score += 1;
+                    });
+                    if (score > bestScore) { bestScore = score; bestRec = rec.topic; }
+                });
+
+                if (bestRec && bestScore > 0) {
+                    topicToIssueCategory[key] = bestRec;
+                    return;
+                }
+
+                // 3. Fallback: first rec in bucket (highest goalAlignmentScore after sort)
+                topicToIssueCategory[key] = bucketRecs[0].topic;
+            });
+        };
+
+        buildIssueCategoryMap(bucket1, '1', categorizedRows);
+        buildIssueCategoryMap(bucket2, '2', categorizedRows);
+        buildIssueCategoryMap(bucket3, '3', categorizedRows);
+
+        // Now stamp ISSUE_CATEGORY onto every categorized row
+        categorizedRows.forEach((row) => {
+            const key = (row.TOPIC || '').toLowerCase().trim();
+            if (row.BUCKET && row.BUCKET !== '0') {
+                const issueCategory = topicToIssueCategory[key];
+                if (issueCategory) {
+                    (row as any).ISSUE_CATEGORY = issueCategory;
+                } else {
+                    // Bucket is known but no rec mapping — use the bucket's primary rec topic
+                    const bktRecs = row.BUCKET === '1' ? bucket1 : row.BUCKET === '2' ? bucket2 : bucket3;
+                    if (bktRecs && bktRecs.length > 0) {
+                        (row as any).ISSUE_CATEGORY = bktRecs[0].topic;
+                    }
+                }
+            }
+        });
 
         log.recommendationsGenerated = bucket1.length + bucket2.length + bucket3.length;
 
