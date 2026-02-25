@@ -37,7 +37,7 @@ export const analyzeConversationsWithBatching = async (
     originalCsvStats?: { total: number; filteredOut: number; filterStatuses: string[] }
 ): Promise<AnalysisResult> => {
     const progressFn = onProgress || (() => { });
-    if (csvData.length <= 250 && !(chatLogData && chatLogData.length > 0)) {
+    if (csvData.length <= 500 && !(chatLogData && chatLogData.length > 0)) {
         return analyzeConversations(csvData, botSummary, goals, model, geminiApiKey, openaiApiKey, standardLogData, chatLogData);
     }
     // If only chatLogData is present (no CRA csv), fall through to analyzeConversations too

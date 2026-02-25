@@ -174,6 +174,7 @@ export const exportLogAsMarkdown = (log: AnalysisLog) => {
                 v.message,
                 v.details || "--"
             ])
+
         }
     ];
 

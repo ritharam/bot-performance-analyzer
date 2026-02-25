@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
+import XLSXStyle from 'xlsx-js-style';
 import Papa from 'papaparse';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import { analyzeConversations, analyzeConversationsWithBatching } from './services/aiService';
@@ -126,7 +127,8 @@ const App: React.FC = () => {
             RESOLUTION: r.RESOLUTION || '',
             RESOLUTION_STATUS: r.RESOLUTION_STATUS || '',
             RESOLUTION_STATUS_REASONING: r.RESOLUTION_STATUS_REASONING || '',
-            TIME_STAMP: r.TIME_STAMP || '',
+            TOPIC_DESCRIPTION: r.TOPIC_DESCRIPTION || '',
+            TIME_STAMP: r.TIME_STAMP || r.CONVERSATION_START_TIME || '',
             USER_ID: r.USER_ID || '',
             USER_SENTIMENT: r.USER_SENTIMENT || '',
             APPROVAL_STATUS: 'Pending' as 'Pending' | 'Yes' | 'No'
@@ -222,6 +224,7 @@ const App: React.FC = () => {
         csvStats || undefined
       );
       setAnalysisResult(result);
+
       setAnalysisProgress(null);
       setViewMode('dashboard');
       setActiveTab('summary');
@@ -307,106 +310,1087 @@ const App: React.FC = () => {
   const handleExportExcel = () => {
     if (!analysisResult) return;
 
-    const reportElement = document.getElementById('report-content');
-    const originalStyle = reportElement?.getAttribute('style') || '';
-    if (reportElement) {
-      reportElement.style.height = 'auto';
-      reportElement.style.overflow = 'visible';
+
+    // ─── Detect data type ────────────────────────────────────────────────────
+    const rows: any[] = analysisResult.categorizedRows;
+    const isVoiceLog = rows.length > 0 && 'CALL_ID' in rows[0];
+    const isChatLog = rows.length > 0 && 'Session Id' in rows[0];
+
+    // ─── CRA Data: Full styled workbook via xlsx-js-style ────────────────────
+    if (!isVoiceLog && !isChatLog) {
+      const SX = XLSXStyle;
+      const enc = SX.utils.encode_cell;
+
+      // Color palette (matches Decathlon reference)
+      const DARK_SLATE = '34495E';
+      const WHITE = 'FFFFFF';
+      const RED_BG = 'E74C3C';
+      const ORANGE_BG = 'E67E22';
+      const GREEN_BG = '27AE60';
+      const LIGHT_RED = 'FADBD8';
+      const LIGHT_ORANGE = 'FAE5D3';
+      const LIGHT_GREEN = 'D5F4E6';
+      const BLUE_KPI = 'D6EAF8';
+      const ROW_ALT = 'F2F3F4';
+
+      const mkFont = (bold: boolean, sz: number, rgb = '000000') =>
+        ({ bold, sz, name: 'Calibri', color: { rgb } });
+      const mkFill = (rgb: string) =>
+        ({ patternType: 'solid' as const, fgColor: { rgb } });
+      const mkAlign = (horizontal: string, vertical = 'center', wrapText = false) =>
+        ({ horizontal, vertical, wrapText });
+      const mkBorder = () => ({
+        top: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+        bottom: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+        left: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+        right: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+      });
+
+      const noFillBase = { patternType: 'none' as const };
+
+      const cs = (v: any, s: any) => ({ v: v ?? '', s, t: 's' as const });
+      const cn = (v: number, s: any) => ({ v, s, t: 'n' as const });
+      const plainStyle = { font: mkFont(false, 11), fill: noFillBase, alignment: mkAlign('left', 'center') };
+      const plain = (v: any) => ({ v: v ?? '', t: 's' as const, s: plainStyle });
+
+      const hdrStyle = (rgb: string) => ({
+        font: mkFont(true, 10, WHITE),
+        fill: mkFill(rgb),
+        alignment: mkAlign('center', 'center'),
+        border: mkBorder(),
+      });
+      const bgStyle = (rgb: string) => ({
+        font: mkFont(false, 9),
+        fill: mkFill(rgb),
+        alignment: mkAlign('left', 'center', true),
+        border: mkBorder(),
+      });
+      const bgCStyle = (rgb: string) => ({
+        font: mkFont(false, 9),
+        fill: mkFill(rgb),
+        alignment: mkAlign('center', 'center'),
+        border: mkBorder(),
+      });
+      const dataStyle = {
+        font: mkFont(false, 9),
+        fill: noFillBase,
+        alignment: mkAlign('left', 'center', true),
+        border: mkBorder(),
+      };
+      const dataCStyle = {
+        font: mkFont(false, 9),
+        fill: noFillBase,
+        alignment: mkAlign('center', 'center'),
+        border: mkBorder(),
+      };
+
+      // ── Helper: sanitise Python "None" / "null" / empty strings ─────────────
+      const clean = (v: any): string => {
+        if (v === null || v === undefined) return '';
+        const s = String(v).trim();
+        if (s === 'None' || s === 'none' || s === 'null' || s === 'NULL' || s === 'N/A' || s === 'na' || s === 'NA') return '';
+        return s;
+      };
+      const cleanOr = (v: any, fallback: string): string => clean(v) || fallback;
+
+      // ── Derived counts — computed directly from categorizedRows ──────────────
+      // Do NOT rely on rec.count (AI may return 0 for indices[]). Instead count
+      // how many rows in categorizedRows actually carry each bucket assignment.
+      const totalChats = rows.length;
+      const b1Count = rows.filter((r: any) => r.BUCKET === '1').length;
+      const b2Count = rows.filter((r: any) => r.BUCKET === '2').length;
+      const b3Count = rows.filter((r: any) => r.BUCKET === '3').length;
+      const successCount = rows.filter((r: any) => !r.BUCKET || r.BUCKET === '0').length;
+      const unsuccessCount = b1Count + b2Count + b3Count;
+      const successRate = totalChats > 0 ? ((successCount / totalChats) * 100).toFixed(1) + '%' : '0%';
+
+      // ── Per-rec counts: residual method ─────────────────────────────────────
+      // The AI assigns rows to recs via indices[]. When a rec has count=0 it means
+      // its indices array was empty — the residual rows (bktTotal - knownCounts) belong
+      // to it. We compute a resolved count per rec using:
+      //   knownCount  = rec.count if > 0  (set by processBucket from rec.indices.length)
+      //   missingRecs = recs where count === 0
+      //   residual    = bktTotal - sum(knownCounts), split evenly across missingRecs
+      const resolveRecCounts = (
+        recs: BucketRecommendation[],
+        bktTotal: number
+      ): Map<BucketRecommendation, number> => {
+        const result = new Map<BucketRecommendation, number>();
+        const knownSum = recs.reduce((s, r) => s + (r.count > 0 ? r.count : 0), 0);
+        const missing = recs.filter(r => !(r.count > 0));
+        const residual = Math.max(0, bktTotal - knownSum);
+        const perMissing = missing.length > 0 ? Math.round(residual / missing.length) : 0;
+        recs.forEach(r => {
+          result.set(r, r.count > 0 ? r.count : perMissing);
+        });
+        return result;
+      };
+
+      const b1Counts = resolveRecCounts(analysisResult.recommendations.bucket1, b1Count);
+      const b2Counts = resolveRecCounts(analysisResult.recommendations.bucket2, b2Count);
+      const b3Counts = resolveRecCounts(analysisResult.recommendations.bucket3, b3Count);
+
+      const getRecCount = (rec: BucketRecommendation, bucketId: string): number => {
+        const map = bucketId === '1' ? b1Counts : bucketId === '2' ? b2Counts : b3Counts;
+        return map.get(rec) ?? 0;
+      };
+
+      const reportTitle = `${botTitle || 'Chat Bot'} — Resolution Analysis`;
+      const analysisDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+      const generatedAt = `Generated on ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
+
+      // ── Outcome, sentiment & topic aggregations ──────────────────────────────
+      const outcomeCounts: Record<string, number> = {};
+      const sentimentCounts: Record<string, number> = {};
+      const interactionTypes: Record<string, number> = {};
+      rows.forEach((r: any) => {
+        const ok = cleanOr(r.RESOLUTION_STATUS, 'Unknown');
+        outcomeCounts[ok] = (outcomeCounts[ok] || 0) + 1;
+        const sk = cleanOr(r.USER_SENTIMENT, 'Unknown');
+        sentimentCounts[sk] = (sentimentCounts[sk] || 0) + 1;
+        const ik = cleanOr(r.TOPIC, 'General');
+        interactionTypes[ik] = (interactionTypes[ik] || 0) + 1;
+      });
+
+      // =======================================================================
+      // SHEET 1 — Executive Summary
+      // =======================================================================
+      const wsE: any = {};
+      const mE: any[] = [];
+      let eR = 0;
+
+      // Title (plain — no fill)
+      wsE[enc({ c: 0, r: eR })] = plain(reportTitle);
+      mE.push({ s: { c: 0, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      // Subtitle
+      wsE[enc({ c: 0, r: eR })] = plain(`Analysis Period: ${analysisDate} | Total Chats: ${totalChats}`);
+      mE.push({ s: { c: 0, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      // Generated
+      wsE[enc({ c: 0, r: eR })] = plain(generatedAt);
+      mE.push({ s: { c: 0, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      eR++; // blank
+
+      // KPI values row (B=Total, D=SuccessRate, F=Unsuccessful)
+      wsE[enc({ c: 1, r: eR })] = cn(totalChats, { font: mkFont(true, 22, '2C3E50'), fill: mkFill(BLUE_KPI), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 3, r: eR })] = cs(successRate, { font: mkFont(true, 22, '27AE60'), fill: mkFill(LIGHT_GREEN), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 5, r: eR })] = cn(unsuccessCount, { font: mkFont(true, 22, 'C0392B'), fill: mkFill(LIGHT_RED), alignment: mkAlign('center'), border: mkBorder() });
+      mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+      mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+      mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      // KPI labels row
+      wsE[enc({ c: 1, r: eR })] = cs('Total Chats', { font: mkFont(true, 9, '2C3E50'), fill: mkFill(BLUE_KPI), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 3, r: eR })] = cs('Success Rate', { font: mkFont(true, 9, '27AE60'), fill: mkFill(LIGHT_GREEN), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 5, r: eR })] = cs('Unsuccessful Chats', { font: mkFont(true, 9, 'C0392B'), fill: mkFill(LIGHT_RED), alignment: mkAlign('center'), border: mkBorder() });
+      mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+      mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+      mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      eR++; // blank
+
+      // Bucket counts row
+      wsE[enc({ c: 1, r: eR })] = cn(b1Count, { font: mkFont(true, 18, 'C0392B'), fill: mkFill(LIGHT_RED), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 3, r: eR })] = cn(b2Count, { font: mkFont(true, 18, 'D35400'), fill: mkFill(LIGHT_ORANGE), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 5, r: eR })] = cn(b3Count, { font: mkFont(true, 18, '1E8449'), fill: mkFill(LIGHT_GREEN), alignment: mkAlign('center'), border: mkBorder() });
+      mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+      mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+      mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      // Bucket label row
+      wsE[enc({ c: 1, r: eR })] = cs('Bucket 1: New Workflow Required', { font: mkFont(true, 9, 'C0392B'), fill: mkFill(LIGHT_RED), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 3, r: eR })] = cs('Bucket 2: Logic Fix Required', { font: mkFont(true, 9, 'D35400'), fill: mkFill(LIGHT_ORANGE), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 5, r: eR })] = cs('Bucket 3: KB / Script Update', { font: mkFont(true, 9, '1E8449'), fill: mkFill(LIGHT_GREEN), alignment: mkAlign('center'), border: mkBorder() });
+      mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+      mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+      mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      eR++; // blank
+
+      // ── Chat Outcome Distribution ──────────────────────────────────────────
+      wsE[enc({ c: 0, r: eR })] = plain('Chat Outcome Distribution');
+      mE.push({ s: { c: 0, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      ['Chat Outcome', 'Count', '% of Total'].forEach((h, ci) => {
+        wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle(DARK_SLATE));
+      });
+      eR++;
+
+      Object.entries(outcomeCounts)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([status, count], idx) => {
+          const pct = totalChats > 0 ? ((count / totalChats) * 100).toFixed(1) + '%' : '0%';
+          const alt = idx % 2 === 0 ? ROW_ALT : '';
+          wsE[enc({ c: 0, r: eR })] = cs(status, alt ? bgStyle(alt) : dataStyle);
+          wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+          wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+          eR++;
+        });
+
+      eR++; // blank
+
+      // ── User Sentiment Analysis ────────────────────────────────────────────
+      wsE[enc({ c: 0, r: eR })] = plain('User Sentiment Analysis');
+      mE.push({ s: { c: 0, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      ['Sentiment', 'Count', '% of Total'].forEach((h, ci) => {
+        wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle(DARK_SLATE));
+      });
+      eR++;
+
+      Object.entries(sentimentCounts)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([sentiment, count], idx) => {
+          const pct = totalChats > 0 ? ((count / totalChats) * 100).toFixed(1) + '%' : '0%';
+          const alt = idx % 2 === 0 ? ROW_ALT : '';
+          wsE[enc({ c: 0, r: eR })] = cs(sentiment, alt ? bgStyle(alt) : dataStyle);
+          wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+          wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+          eR++;
+        });
+
+      eR++; // blank
+
+      // ── Interaction Type Breakdown ─────────────────────────────────────────
+      wsE[enc({ c: 0, r: eR })] = plain('Interaction Type Breakdown');
+      mE.push({ s: { c: 0, r: eR }, e: { c: 6, r: eR } });
+      eR++;
+
+      ['Type', 'Count', '% of Total'].forEach((h, ci) => {
+        wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle(DARK_SLATE));
+      });
+      eR++;
+
+      Object.entries(interactionTypes)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .forEach(([type, count], idx) => {
+          const pct = totalChats > 0 ? ((count / totalChats) * 100).toFixed(1) + '%' : '0%';
+          const alt = idx % 2 === 0 ? ROW_ALT : '';
+          wsE[enc({ c: 0, r: eR })] = cs(type, alt ? bgStyle(alt) : dataStyle);
+          wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+          wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+          eR++;
+        });
+
+      eR++; // blank
+
+      // ── Bucket Classification Summary ──────────────────────────────────────
+      wsE[enc({ c: 0, r: eR })] = plain('Bucket Classification Summary');
+      mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } });
+      eR++;
+
+      ['Bucket #', 'Bucket Label', 'Chat Count', '% of Unsuccessful', 'Priority', 'Definition'].forEach((h, ci) => {
+        wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle(DARK_SLATE));
+      });
+      eR++;
+
+      [
+        { num: '1', label: 'New Workflow Required', def: 'User intent outside bot scope — new flows needed', cnt: b1Count, accent: RED_BG, light: LIGHT_RED },
+        { num: '2', label: 'Logic Fix Required', def: 'Existing flow breaks or produces incorrect output', cnt: b2Count, accent: ORANGE_BG, light: LIGHT_ORANGE },
+        { num: '3', label: 'KB / Script Update', def: 'Flow works but content/KB is incomplete or wrong', cnt: b3Count, accent: GREEN_BG, light: LIGHT_GREEN },
+      ].forEach(({ num, label, def, cnt, accent }) => {
+        const pct = unsuccessCount > 0 ? ((cnt / unsuccessCount) * 100).toFixed(1) + '%' : '0%';
+        wsE[enc({ c: 0, r: eR })] = cs(num, { font: mkFont(true, 9, WHITE), fill: mkFill(accent), alignment: mkAlign('center'), border: mkBorder() });
+        wsE[enc({ c: 1, r: eR })] = cs(label, dataStyle);
+        wsE[enc({ c: 2, r: eR })] = cn(cnt, dataCStyle);
+        wsE[enc({ c: 3, r: eR })] = cs(pct, dataCStyle);
+        wsE[enc({ c: 4, r: eR })] = cs(num === '1' ? 'High' : num === '2' ? 'Medium' : 'Low', dataCStyle);
+        wsE[enc({ c: 5, r: eR })] = cs(def, { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() });
+        eR++;
+      });
+
+      eR++; // blank
+
+      // ── Prioritization Roadmap ─────────────────────────────────────────────
+      wsE[enc({ c: 0, r: eR })] = plain('Prioritization Roadmap');
+      mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } });
+      eR++;
+
+      ['Priority', 'Issue Category', 'Bucket', 'Chat Count', 'Goal Alignment', 'Strategic Priority', 'KPI to Watch', 'Problem Statement', 'Recommended Action'].forEach((h, ci) => {
+        wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle(DARK_SLATE));
+      });
+      eR++;
+
+      const allRecs: Array<{ rec: BucketRecommendation; bucket: string; light: string }> = [
+        ...analysisResult.recommendations.bucket1.map((r: BucketRecommendation) => ({ rec: r, bucket: '1', light: LIGHT_RED })),
+        ...analysisResult.recommendations.bucket2.map((r: BucketRecommendation) => ({ rec: r, bucket: '2', light: LIGHT_ORANGE })),
+        ...analysisResult.recommendations.bucket3.map((r: BucketRecommendation) => ({ rec: r, bucket: '3', light: LIGHT_GREEN })),
+      ].sort((a, b) => (b.rec.goalAlignmentScore || 0) - (a.rec.goalAlignmentScore || 0));
+
+      allRecs.forEach(({ rec, bucket, light }, idx) => {
+        const rowStyle = (wt = false) => ({
+          font: mkFont(false, 9),
+          fill: mkFill(light),
+          alignment: mkAlign(wt ? 'left' : 'center', 'center', wt),
+          border: mkBorder(),
+        });
+        const cnt = getRecCount(rec, bucket);
+        wsE[enc({ c: 0, r: eR })] = cn(idx + 1, rowStyle());
+        wsE[enc({ c: 1, r: eR })] = cs(rec.topic, rowStyle(true));
+        wsE[enc({ c: 2, r: eR })] = cs(`Bucket ${bucket}`, rowStyle());
+        wsE[enc({ c: 3, r: eR })] = cn(cnt, rowStyle());
+        wsE[enc({ c: 4, r: eR })] = cn(rec.goalAlignmentScore || 0, rowStyle());
+        wsE[enc({ c: 5, r: eR })] = cs(rec.strategicPriority, rowStyle());
+        wsE[enc({ c: 6, r: eR })] = cs(cleanOr(rec.kpiToWatch, '—'), rowStyle(true));
+        wsE[enc({ c: 7, r: eR })] = cs(cleanOr(rec.problemStatement, '—'), rowStyle(true));
+        wsE[enc({ c: 8, r: eR })] = cs(cleanOr(rec.recommendation, '—'), rowStyle(true));
+        eR++;
+      });
+
+      wsE['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 8, r: eR } });
+      wsE['!merges'] = mE;
+      wsE['!cols'] = [{ wch: 28 }, { wch: 16 }, { wch: 12 }, { wch: 12 }, { wch: 15 }, { wch: 16 }, { wch: 35 }, { wch: 40 }, { wch: 40 }];
+
+      // =======================================================================
+      // SHEET 2 — Bucket 1: New Workflow Required
+      // =======================================================================
+      const wsB1: any = {};
+      const mB1: any[] = [];
+      const b1Recs: BucketRecommendation[] = analysisResult.recommendations.bucket1;
+
+      wsB1[enc({ c: 0, r: 0 })] = plain(`Bucket 1: New Workflow Required`);
+      mB1.push({ s: { c: 0, r: 0 }, e: { c: 9, r: 0 } });
+      wsB1[enc({ c: 0, r: 1 })] = plain(`Total: ${b1Count} chats | ${unsuccessCount > 0 ? ((b1Count / unsuccessCount) * 100).toFixed(1) : '0'}% of unsuccessful`);
+      mB1.push({ s: { c: 0, r: 1 }, e: { c: 9, r: 1 } });
+
+      const b1Hdr = ['Priority', 'Issue Category', 'Chat Count', '% of Bucket', 'Problem Description', 'Root Cause', 'Transcript Excerpts', 'Recommended Fix', 'Complexity', 'Approval Status'];
+      b1Hdr.forEach((h, ci) => { wsB1[enc({ c: ci, r: 3 })] = cs(h, hdrStyle(RED_BG)); });
+
+      b1Recs.forEach((rec, idx) => {
+        const r = idx + 4;
+        const cnt = getRecCount(rec, '1');
+        const pct = b1Count > 0 ? ((cnt / b1Count) * 100).toFixed(1) + '%' : '0%';
+        const alt = idx % 2 === 0 ? LIGHT_RED : '';
+        const rs = alt ? bgStyle(alt) : dataStyle;
+        const rc = alt ? bgCStyle(alt) : dataCStyle;
+        const wrapS = alt
+          ? { font: mkFont(false, 9), fill: mkFill(alt), alignment: mkAlign('left', 'center', true), border: mkBorder() }
+          : { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
+        wsB1[enc({ c: 0, r })] = cn(idx + 1, rc);
+        wsB1[enc({ c: 1, r })] = cs(rec.topic, rs);
+        wsB1[enc({ c: 2, r })] = cn(cnt, rc);
+        wsB1[enc({ c: 3, r })] = cs(pct, rc);
+        wsB1[enc({ c: 4, r })] = cs(cleanOr(rec.problemStatement, '—'), wrapS);
+        wsB1[enc({ c: 5, r })] = cs(cleanOr((rec as any).rootCause || rec.problemStatement, '—'), wrapS);
+        wsB1[enc({ c: 6, r })] = cs(rec.examples.slice(0, 2).map(clean).filter(Boolean).join(' | ') || '—', wrapS);
+        wsB1[enc({ c: 7, r })] = cs(cleanOr(rec.recommendation, '—'), wrapS);
+        wsB1[enc({ c: 8, r })] = cs(rec.strategicPriority, rc);
+        wsB1[enc({ c: 9, r })] = cs('Pending', rc);
+      });
+
+      const b1LastR = 4 + b1Recs.length;
+      wsB1[enc({ c: 0, r: b1LastR })] = plain(`Total: ${b1Count} chats across ${b1Recs.length} categories`);
+      mB1.push({ s: { c: 0, r: b1LastR }, e: { c: 9, r: b1LastR } });
+      wsB1['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 9, r: b1LastR } });
+      wsB1['!merges'] = mB1;
+      wsB1['!cols'] = [{ wch: 10 }, { wch: 25 }, { wch: 12 }, { wch: 12 }, { wch: 40 }, { wch: 40 }, { wch: 50 }, { wch: 45 }, { wch: 12 }, { wch: 15 }];
+
+      // =======================================================================
+      // SHEET 3 — Bucket 2: Logic Fix Required
+      // =======================================================================
+      const wsB2: any = {};
+      const mB2: any[] = [];
+      const b2Recs: BucketRecommendation[] = analysisResult.recommendations.bucket2;
+
+      wsB2[enc({ c: 0, r: 0 })] = plain(`Bucket 2: Logic Fix Required`);
+      mB2.push({ s: { c: 0, r: 0 }, e: { c: 9, r: 0 } });
+      wsB2[enc({ c: 0, r: 1 })] = plain(`Total: ${b2Count} chats | ${unsuccessCount > 0 ? ((b2Count / unsuccessCount) * 100).toFixed(1) : '0'}% of unsuccessful`);
+      mB2.push({ s: { c: 0, r: 1 }, e: { c: 9, r: 1 } });
+
+      const b2Hdr = ['Priority', 'Issue Category', 'Chat Count', '% of Bucket', 'Problem Description', 'Root Cause', 'Transcript Excerpts', 'Recommended Fix', 'Complexity', 'Approval Status'];
+      b2Hdr.forEach((h, ci) => { wsB2[enc({ c: ci, r: 3 })] = cs(h, hdrStyle(ORANGE_BG)); });
+
+      b2Recs.forEach((rec, idx) => {
+        const r = idx + 4;
+        const cnt = getRecCount(rec, '2');
+        const pct = b2Count > 0 ? ((cnt / b2Count) * 100).toFixed(1) + '%' : '0%';
+        const alt = idx % 2 === 0 ? LIGHT_ORANGE : '';
+        const rs = alt ? bgStyle(alt) : dataStyle;
+        const rc = alt ? bgCStyle(alt) : dataCStyle;
+        const wrapS = alt
+          ? { font: mkFont(false, 9), fill: mkFill(alt), alignment: mkAlign('left', 'center', true), border: mkBorder() }
+          : { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
+        wsB2[enc({ c: 0, r })] = cn(idx + 1, rc);
+        wsB2[enc({ c: 1, r })] = cs(rec.topic, rs);
+        wsB2[enc({ c: 2, r })] = cn(cnt, rc);
+        wsB2[enc({ c: 3, r })] = cs(pct, rc);
+        wsB2[enc({ c: 4, r })] = cs(cleanOr(rec.problemStatement, '—'), wrapS);
+        wsB2[enc({ c: 5, r })] = cs(cleanOr((rec as any).rootCause || rec.problemStatement, '—'), wrapS);
+        wsB2[enc({ c: 6, r })] = cs(rec.examples.slice(0, 2).map(clean).filter(Boolean).join(' | ') || '—', wrapS);
+        wsB2[enc({ c: 7, r })] = cs(cleanOr(rec.recommendation, '—'), wrapS);
+        wsB2[enc({ c: 8, r })] = cs(rec.strategicPriority, rc);
+        wsB2[enc({ c: 9, r })] = cs('Pending', rc);
+      });
+
+      const b2LastR = 4 + b2Recs.length;
+      wsB2[enc({ c: 0, r: b2LastR })] = plain(`Total: ${b2Count} chats across ${b2Recs.length} categories`);
+      mB2.push({ s: { c: 0, r: b2LastR }, e: { c: 9, r: b2LastR } });
+      wsB2['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 9, r: b2LastR } });
+      wsB2['!merges'] = mB2;
+      wsB2['!cols'] = [{ wch: 10 }, { wch: 25 }, { wch: 12 }, { wch: 12 }, { wch: 40 }, { wch: 40 }, { wch: 50 }, { wch: 45 }, { wch: 12 }, { wch: 15 }];
+
+      // =======================================================================
+      // SHEET 4 — Bucket 3: KB / Script Update
+      // =======================================================================
+      const wsB3: any = {};
+      const mB3: any[] = [];
+      const b3Recs: BucketRecommendation[] = analysisResult.recommendations.bucket3;
+
+      wsB3[enc({ c: 0, r: 0 })] = plain(`Bucket 3: KB / Script Update`);
+      mB3.push({ s: { c: 0, r: 0 }, e: { c: 9, r: 0 } });
+      wsB3[enc({ c: 0, r: 1 })] = plain(`Total: ${b3Count} chats | ${unsuccessCount > 0 ? ((b3Count / unsuccessCount) * 100).toFixed(1) : '0'}% of unsuccessful`);
+      mB3.push({ s: { c: 0, r: 1 }, e: { c: 9, r: 1 } });
+
+      const b3Hdr = ['Priority', 'Issue Category', 'Chat Count', '% of Bucket', 'Problem Description', 'Root Cause', 'Transcript Excerpts', 'Recommended Fix', 'Complexity', 'Approval Status'];
+      b3Hdr.forEach((h, ci) => { wsB3[enc({ c: ci, r: 3 })] = cs(h, hdrStyle(GREEN_BG)); });
+
+      b3Recs.forEach((rec, idx) => {
+        const r = idx + 4;
+        const cnt = getRecCount(rec, '3');
+        const pct = b3Count > 0 ? ((cnt / b3Count) * 100).toFixed(1) + '%' : '0%';
+        const alt = idx % 2 === 0 ? LIGHT_GREEN : '';
+        const rs = alt ? bgStyle(alt) : dataStyle;
+        const rc = alt ? bgCStyle(alt) : dataCStyle;
+        const wrapS = alt
+          ? { font: mkFont(false, 9), fill: mkFill(alt), alignment: mkAlign('left', 'center', true), border: mkBorder() }
+          : { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
+        wsB3[enc({ c: 0, r })] = cn(idx + 1, rc);
+        wsB3[enc({ c: 1, r })] = cs(rec.topic, rs);
+        wsB3[enc({ c: 2, r })] = cn(cnt, rc);
+        wsB3[enc({ c: 3, r })] = cs(pct, rc);
+        wsB3[enc({ c: 4, r })] = cs(cleanOr(rec.problemStatement, '—'), wrapS);
+        wsB3[enc({ c: 5, r })] = cs(cleanOr((rec as any).rootCause || rec.problemStatement, '—'), wrapS);
+        wsB3[enc({ c: 6, r })] = cs(rec.examples.slice(0, 2).map(clean).filter(Boolean).join(' | ') || '—', wrapS);
+        wsB3[enc({ c: 7, r })] = cs(cleanOr(rec.recommendation, '—'), wrapS);
+        wsB3[enc({ c: 8, r })] = cs(rec.strategicPriority, rc);
+        wsB3[enc({ c: 9, r })] = cs('Pending', rc);
+      });
+
+      const b3LastR = 4 + b3Recs.length;
+      wsB3[enc({ c: 0, r: b3LastR })] = plain(`Total: ${b3Count} chats across ${b3Recs.length} categories`);
+      mB3.push({ s: { c: 0, r: b3LastR }, e: { c: 9, r: b3LastR } });
+      wsB3['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 9, r: b3LastR } });
+      wsB3['!merges'] = mB3;
+      wsB3['!cols'] = [{ wch: 10 }, { wch: 25 }, { wch: 12 }, { wch: 12 }, { wch: 40 }, { wch: 40 }, { wch: 50 }, { wch: 45 }, { wch: 12 }, { wch: 15 }];
+
+      // =======================================================================
+      // SHEET 5 — Raw Data  (11 cols: removed Analysis Type, Start Time, End Time)
+      // =======================================================================
+      const wsRaw: any = {};
+      const mRaw: any[] = [];
+
+      // Col count is now 11 (indices 0-10)
+      wsRaw[enc({ c: 0, r: 0 })] = plain(`Raw Data — All ${totalChats} Chats`);
+      mRaw.push({ s: { c: 0, r: 0 }, e: { c: 10, r: 0 } });
+
+      const rawHdr = ['Row #', 'Chat URL', 'Chat Outcome', 'Bucket #', 'Bucket Label', 'Issue Category', 'Topic', 'User Query', 'Resolution', 'Resolution Status', 'User Sentiment'];
+      rawHdr.forEach((h, ci) => { wsRaw[enc({ c: ci, r: 2 })] = cs(h, hdrStyle(DARK_SLATE)); });
+
+      rows.forEach((r: any, idx) => {
+        const rn = idx + 3;
+        const bkt = r.BUCKET || '0';
+        const rowBg = bkt === '1' ? LIGHT_RED : bkt === '2' ? LIGHT_ORANGE : bkt === '3' ? LIGHT_GREEN : '';
+        const rs = rowBg ? bgStyle(rowBg) : dataStyle;
+        const rc = rowBg ? bgCStyle(rowBg) : dataCStyle;
+        const bktAccent = bkt === '1' ? RED_BG : bkt === '2' ? ORANGE_BG : bkt === '3' ? GREEN_BG : DARK_SLATE;
+        const bktLabel = bkt === '1' ? 'Bucket 1 - New Workflow Required'
+          : bkt === '2' ? 'Bucket 2 - Logic Fix Required'
+            : bkt === '3' ? 'Bucket 3 - KB / Script Update'
+              : 'Resolved / Out of Scope';
+
+        const rowNumStyle = { font: mkFont(false, 9), fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('right', 'center'), border: mkBorder() };
+        const urlLinkStyle = { font: { bold: false, sz: 9, name: 'Calibri', color: { rgb: '1155CC' }, underline: true }, fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('center', 'center'), border: mkBorder() };
+        const bktNumStyle = bkt !== '0'
+          ? { font: mkFont(true, 9, WHITE), fill: mkFill(bktAccent), alignment: mkAlign('center'), border: mkBorder() }
+          : { font: mkFont(false, 9, DARK_SLATE), fill: noFillBase, alignment: mkAlign('center'), border: mkBorder() };
+        const wrapRs = { font: mkFont(false, 9), fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
+
+        // Sanitise RESOLUTION — strip Python "None", then try every fallback field
+        const resolutionText =
+          clean(r.RESOLUTION) ||  // primary field
+          clean(r.TOPIC_DESCRIPTION) ||  // CRA CSV: description of what happened
+          clean(r.RESOLUTION_STATUS_REASONING) ||  // AI reasoning for resolution status
+          clean(r.BOT_SUMMARY) ||  // voice-log style summaries
+          clean(r.CONVERSATION_SUMMARY) ||
+          clean(r.USER_SUMMARY) ||
+          'No resolution recorded';                  // final human-readable fallback
+
+        wsRaw[enc({ c: 0, r: rn })] = cn(idx + 1, rowNumStyle);
+        if (r.CHATURL && clean(r.CHATURL)) {
+          wsRaw[enc({ c: 1, r: rn })] = { v: 'Open Chat', t: 's', s: urlLinkStyle, l: { Target: r.CHATURL } };
+        } else {
+          wsRaw[enc({ c: 1, r: rn })] = cs('—', rc);
+        }
+        wsRaw[enc({ c: 2, r: rn })] = cs(cleanOr(r.RESOLUTION_STATUS, 'unknown'), rs);
+        wsRaw[enc({ c: 3, r: rn })] = cs(bkt === '0' ? '' : bkt, bktNumStyle);
+        wsRaw[enc({ c: 4, r: rn })] = cs(bktLabel, rs);
+        wsRaw[enc({ c: 5, r: rn })] = cs(cleanOr(r.BUCKET_LABEL, cleanOr(r.TOPIC, '—')), rs);
+        wsRaw[enc({ c: 6, r: rn })] = cs(cleanOr(r.TOPIC, '—'), rs);
+        wsRaw[enc({ c: 7, r: rn })] = cs(cleanOr(r.USER_QUERY, '—'), wrapRs);
+        wsRaw[enc({ c: 8, r: rn })] = cs(resolutionText, wrapRs);
+        wsRaw[enc({ c: 9, r: rn })] = cs(cleanOr(r.RESOLUTION_STATUS, 'unknown'), rc);
+        wsRaw[enc({ c: 10, r: rn })] = cs(cleanOr(r.USER_SENTIMENT, '—'), rc);
+      });
+
+      wsRaw['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 10, r: 2 + rows.length } });
+      wsRaw['!merges'] = mRaw;
+      wsRaw['!cols'] = [{ wch: 7 }, { wch: 18 }, { wch: 22 }, { wch: 9 }, { wch: 28 }, { wch: 28 }, { wch: 25 }, { wch: 45 }, { wch: 55 }, { wch: 20 }, { wch: 15 }];
+
+      // ── Assemble workbook & download via Blob (avoids Chrome HTTP warning) ──
+      const wb = SX.utils.book_new();
+      SX.utils.book_append_sheet(wb, wsE, 'Executive Summary');
+      SX.utils.book_append_sheet(wb, wsB1, 'Bucket 1 - New Workflow');
+      SX.utils.book_append_sheet(wb, wsB2, 'Bucket 2 - Logic Fix');
+      SX.utils.book_append_sheet(wb, wsB3, 'Bucket 3 - Script Update');
+      SX.utils.book_append_sheet(wb, wsRaw, 'Raw Data');
+
+      // Write to ArrayBuffer → Blob → object URL (no Chrome "insecure download" warning)
+      const wbOut = SX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([wbOut], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${botTitle || botId || 'ChatBot_Resolution_Analysis'}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(a); }, 1000);
+      return;
     }
 
-    const wb = XLSX.utils.book_new();
+    // ─── Chat Log: plain XLSX export ─────────────────────────────────────────
+    if (isChatLog) {
+      const wb = XLSX.utils.book_new();
+      const fmtRecs = (recs: BucketRecommendation[]) => [
+        ["Topic", "Priority", "Score", "Problem Statement", "Recommendation", "KPI to Watch", "Examples"],
+        ...recs.map(r => [r.topic, r.strategicPriority, r.goalAlignmentScore, r.problemStatement, r.recommendation, r.kpiToWatch, r.examples.join(' | ')])
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fmtRecs(analysisResult.recommendations.bucket1)), "1-Expansion");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fmtRecs(analysisResult.recommendations.bucket2)), "2-Optimization");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fmtRecs(analysisResult.recommendations.bucket3)), "3-KnowledgeGaps");
+      const auditHeader = ["Pillar", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"];
+      const auditRows = rows.map((r: any) => {
+        const bn = r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : r.BUCKET === '3' ? 'GAPS' : 'RESOLVED';
+        return [bn, r.TOPIC, r['Session Id'], r['Created Date'], r['Journey:Step'], r['Source'], r['Interaction medium'], r['Language'], r['Message'], r['Translated message'], r['Feedback']];
+      });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([auditHeader, ...auditRows]), "Full Audit Log");
+      const clOut = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const clBlob = new Blob([clOut], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const clUrl = URL.createObjectURL(clBlob);
+      const clA = document.createElement('a');
+      clA.href = clUrl;
+      clA.download = `${botTitle || botId || 'ChatLog_Audit_Report'}.xlsx`;
+      document.body.appendChild(clA); clA.click();
+      setTimeout(() => { URL.revokeObjectURL(clUrl); document.body.removeChild(clA); }, 1000);
+      return;
+    }
 
-    const execData = [
-      ["STRATEGIC PERFORMANCE AUDIT - EXECUTIVE OVERVIEW"],
-      [`Bot ID: ${botId || 'N/A'}`],
-      [`Analysis Date: ${new Date().toLocaleDateString()}`],
-      [],
-      ["KEY PERFORMANCE INDICATORS"],
-      ["Metric", "Value", "Pillar Status"],
-      ["Total Chats Analyzed", summary.totalChats, "N/A"],
-      ["Total Rows Processed", analysisResult.totalRowsProcessed || summary.totalChats, "Full Dataset Coverage"],
-      ["Service Expansion (Bucket 1)", summary.bucketDistribution['1'], "Critical Growth"],
-      ["System Optimization (Bucket 2)", summary.bucketDistribution['2'], "Urgent Fixes"],
-      ["Information Gaps (Bucket 3)", summary.bucketDistribution['3'], "Knowledge Updates"],
-      [],
-      ["RESOLUTION OUTCOMES BREAKDOWN"],
-      ["Status", "Count"],
-      ...Object.entries(summary.statusBreakdown).map(([k, v]) => [k, v])
-    ];
-    const wsExec = XLSX.utils.aoa_to_sheet(execData);
-    XLSX.utils.book_append_sheet(wb, wsExec, "Executive Overview");
+    // ─── VOICE LOGS: Full styled workbook via xlsx-js-style ─────────────────
+    // xlsx-js-style is a drop-in fork of xlsx that actually writes cell styles.
 
-    const formatRecommendations = (recs: BucketRecommendation[]) => {
-      const header = ["Topic", "Priority", "Score", "Problem Statement", "Recommendation", "KPI to Watch", "Examples"];
-      const rows = recs.map(r => [
-        r.topic,
-        r.strategicPriority,
-        r.goalAlignmentScore,
-        r.problemStatement,
-        r.recommendation,
-        r.kpiToWatch,
-        r.examples.join(' | ')
-      ]);
-      return [header, ...rows];
+    const SX = XLSXStyle; // alias for brevity
+    const enc = SX.utils.encode_cell;
+
+    // ── Color palette ────────────────────────────────────────────────────────
+    const DARK_SLATE = '34495E';
+    const WHITE = 'FFFFFF';
+    const RED_BG = 'E74C3C';
+    const ORANGE_BG = 'E67E22';
+    const GREEN_BG = '27AE60';
+    const LIGHT_RED = 'FADBD8';
+    const LIGHT_ORANGE = 'FAE5D3';
+    const LIGHT_GREEN = 'D5F4E6';
+    const ORANGE_SOFT = 'F0B27A';
+    const TITLE_BG = 'EBF5FB';
+    const ROW_ALT = 'F2F3F4';
+
+    // ── Style builders ───────────────────────────────────────────────────────
+    const mkFont = (bold: boolean, sz: number, rgb = '000000') =>
+      ({ bold, sz, name: 'Calibri', color: { rgb } });
+    const mkFill = (rgb: string) =>
+      ({ patternType: 'solid' as const, fgColor: { rgb } });
+    const mkAlign = (horizontal: string, vertical = 'center', wrapText = false) =>
+      ({ horizontal, vertical, wrapText });
+    const mkBorder = () => ({
+      top: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+      bottom: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+      left: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+      right: { style: 'thin' as const, color: { rgb: 'D5D8DC' } },
+    });
+
+    // Base style objects — all plain objects, no spread of functions
+    const titleStyle = {
+      font: mkFont(true, 14, DARK_SLATE),
+      fill: mkFill(TITLE_BG),
+      alignment: mkAlign('center', 'center'),
+    };
+    const subtitleStyle = {
+      font: mkFont(false, 10, '555555'),
+      fill: mkFill(TITLE_BG),
+      alignment: mkAlign('center', 'center'),
+    };
+    const genStyle = {
+      font: mkFont(false, 9, '888888'),
+      fill: mkFill(TITLE_BG),
+      alignment: mkAlign('center', 'center'),
+    };
+    const kpiValStyle = {
+      font: mkFont(true, 22, DARK_SLATE),
+      alignment: mkAlign('center', 'center'),
+      border: mkBorder(),
+    };
+    const kpiLblStyle = {
+      font: mkFont(true, 9, '777777'),
+      alignment: mkAlign('center', 'center'),
+      border: mkBorder(),
+    };
+    const dataStyle = {
+      font: mkFont(false, 9),
+      alignment: mkAlign('left', 'center', true),
+      border: mkBorder(),
+    };
+    const dataCStyle = {
+      font: mkFont(false, 9),
+      alignment: mkAlign('center', 'center'),
+      border: mkBorder(),
+    };
+    const dataNumStyle = {
+      font: mkFont(false, 9),
+      alignment: mkAlign('right', 'center'),
+      border: mkBorder(),
+    };
+    const linkStyle = {
+      font: { bold: false, sz: 9, name: 'Calibri', color: { rgb: '1155CC' }, underline: true },
+      alignment: mkAlign('center', 'center'),
+      border: mkBorder(),
     };
 
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(formatRecommendations(analysisResult.recommendations.bucket1)), "1-Expansion");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(formatRecommendations(analysisResult.recommendations.bucket2)), "2-Optimization");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(formatRecommendations(analysisResult.recommendations.bucket3)), "3-KnowledgeGaps");
-
-    const auditHeader = analysisResult.categorizedRows[0]?.CALL_ID
-      ? ["Pillar", "Outcome", "Topic", "Call ID", "Duration", "Conversation Summary", "User Summary", "Recording"]
-      : analysisResult.categorizedRows[0]?.['Session Id']
-        ? ["Pillar", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"]
-        : ["Pillar", "Outcome", "Topic", "User Query", "Chat URL"];
-
-    const auditRows = analysisResult.categorizedRows.map((r: any) => {
-      const bucketName = r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : r.BUCKET === '3' ? 'GAPS' : 'RESOLVED';
-
-      if (r.CALL_ID) {
-        return [
-          bucketName,
-          r.RESOLUTION_STATUS,
-          r.TOPIC,
-          r.CALL_ID,
-          r.CALL_DURATION,
-          r.CONVERSATION_SUMMARY,
-          r.USER_SUMMARY,
-          r.RECORDING_URL ? { f: `HYPERLINK("${r.RECORDING_URL}", "Open Recording")` } : "--"
-        ];
-      }
-
-      if (r['Session Id']) {
-        return [
-          bucketName,
-          r.TOPIC,
-          r['Session Id'],
-          r['Created Date'],
-          r['Journey:Step'],
-          r['Source'],
-          r['Interaction medium'],
-          r['Language'],
-          r['Message'],
-          r['Translated message'],
-          r['Feedback']
-        ];
-      }
-
-      const rowData = [
-        bucketName,
-        r.RESOLUTION_STATUS,
-        r.TOPIC,
-        r.USER_QUERY,
-        r.CHATURL ? { f: `HYPERLINK("${r.CHATURL}", "Open Chat")` } : "--"
-      ];
-      return rowData;
+    // Per-color helper styles
+    const hdrStyle = (rgb: string) => ({
+      font: mkFont(true, 10, WHITE),
+      fill: mkFill(rgb),
+      alignment: mkAlign('center', 'center'),
+      border: mkBorder(),
     });
-    const wsAudit = XLSX.utils.aoa_to_sheet([auditHeader, ...auditRows]);
-    XLSX.utils.book_append_sheet(wb, wsAudit, "Full Audit Log");
+    const bgStyle = (rgb: string) => ({
+      font: mkFont(false, 9),
+      fill: mkFill(rgb),
+      alignment: mkAlign('left', 'center', true),
+      border: mkBorder(),
+    });
+    const bgCStyle = (rgb: string) => ({
+      font: mkFont(false, 9),
+      fill: mkFill(rgb),
+      alignment: mkAlign('center', 'center'),
+      border: mkBorder(),
+    });
 
-    if (reportElement) reportElement.setAttribute('style', originalStyle);
+    // Cell constructors
+    const cs = (v: any, s: any) => ({ v, s, t: typeof v === 'number' ? 'n' : 's' });
+    const cn = (v: number, s: any) => ({ v, s, t: 'n' as const });
 
-    XLSX.writeFile(wb, `${botTitle || botId || 'Audit_Report'}.xlsx`);
+    // ── Derived counts ───────────────────────────────────────────────────────
+    const b1Count = summary.bucketDistribution['1'] || 0;
+    const b2Count = summary.bucketDistribution['2'] || 0;
+    const b3Count = summary.bucketDistribution['3'] || 0;
+    const totalCalls = rows.length;
+    const successCount = rows.filter((r: any) => !r.BUCKET || r.BUCKET === '0').length;
+    const unsuccessCount = totalCalls - successCount;
+    const successRate = totalCalls > 0 ? ((successCount / totalCalls) * 100).toFixed(1) + '%' : '0%';
+
+    // ── Outcome & hangup aggregations ────────────────────────────────────────
+    const outcomeCounts: Record<string, { count: number; totalDur: number }> = {};
+    const hangupCounts: Record<string, number> = {};
+    rows.forEach((r: any) => {
+      const ok = r.TOPIC || r.HANGUP_REASON || 'Unknown';
+      if (!outcomeCounts[ok]) outcomeCounts[ok] = { count: 0, totalDur: 0 };
+      outcomeCounts[ok].count++;
+      outcomeCounts[ok].totalDur += Number(r.CALL_DURATION) || 0;
+      const hk = `${r.HANGUP_SOURCE || 'unknown'}|||${r.HANGUP_REASON || 'unknown'}`;
+      hangupCounts[hk] = (hangupCounts[hk] || 0) + 1;
+    });
+
+    const reportTitle = `${botTitle || 'Voice Bot'} — Call Resolution Analysis`;
+    const analysisDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    const generatedAt = new Date().toISOString().slice(0, 16).replace('T', ' ');
+
+    // =========================================================================
+    // SHEET 1 — Executive Summary  (no nav row; starts at row 0)
+    // =========================================================================
+    const wsE: any = {};
+    const mE: any[] = [];
+    let eR = 0;
+
+    // Title block — rows 0-2
+    wsE[enc({ c: 0, r: eR })] = cs(reportTitle, titleStyle);
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    wsE[enc({ c: 0, r: eR })] = cs(
+      `Analysis Period: ${analysisDate} | Total Calls: ${totalCalls} | Workflow: Voice Bot Analysis`,
+      subtitleStyle
+    );
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    wsE[enc({ c: 0, r: eR })] = cs(`Generated: ${generatedAt}`, genStyle);
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    eR++; // blank spacer
+
+    // KPI section header
+    wsE[enc({ c: 0, r: eR })] = cs('KEY PERFORMANCE INDICATORS', hdrStyle(DARK_SLATE));
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    // KPI values
+    wsE[enc({ c: 1, r: eR })] = cn(totalCalls, kpiValStyle);
+    wsE[enc({ c: 3, r: eR })] = cs(successRate, { ...kpiValStyle, font: mkFont(true, 22, GREEN_BG) });
+    wsE[enc({ c: 5, r: eR })] = cn(unsuccessCount, { ...kpiValStyle, font: mkFont(true, 22, RED_BG) });
+    mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+    mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+    mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } }); eR++;
+
+    // KPI labels
+    wsE[enc({ c: 1, r: eR })] = cs('Total Calls', kpiLblStyle);
+    wsE[enc({ c: 3, r: eR })] = cs('Success Rate', kpiLblStyle);
+    wsE[enc({ c: 5, r: eR })] = cs('Unsuccessful Calls', kpiLblStyle);
+    mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+    mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+    mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } }); eR++;
+
+    eR++; // blank spacer
+
+    // Bucket count values
+    wsE[enc({ c: 1, r: eR })] = cn(b1Count, { ...kpiValStyle, font: mkFont(true, 18, RED_BG) });
+    wsE[enc({ c: 3, r: eR })] = cn(b2Count, { ...kpiValStyle, font: mkFont(true, 18, ORANGE_BG) });
+    wsE[enc({ c: 5, r: eR })] = cn(b3Count, { ...kpiValStyle, font: mkFont(true, 18, GREEN_BG) });
+    mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+    mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+    mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } }); eR++;
+
+    // Bucket labels
+    wsE[enc({ c: 1, r: eR })] = cs('Bucket 1: New Workflow ▸', { ...kpiLblStyle, font: mkFont(true, 9, RED_BG) });
+    wsE[enc({ c: 3, r: eR })] = cs('Bucket 2: Logic Fix ▸', { ...kpiLblStyle, font: mkFont(true, 9, ORANGE_BG) });
+    wsE[enc({ c: 5, r: eR })] = cs('Bucket 3: Script Update ▸', { ...kpiLblStyle, font: mkFont(true, 9, GREEN_BG) });
+    mE.push({ s: { c: 1, r: eR }, e: { c: 2, r: eR } });
+    mE.push({ s: { c: 3, r: eR }, e: { c: 4, r: eR } });
+    mE.push({ s: { c: 5, r: eR }, e: { c: 6, r: eR } }); eR++;
+
+    eR++; // blank spacer
+
+    // Outcome distribution
+    wsE[enc({ c: 0, r: eR })] = cs('CALL OUTCOME DISTRIBUTION', hdrStyle(DARK_SLATE));
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    ['Call Outcome / Topic', 'Count', '% of Total', 'Avg Duration (s)'].forEach((h, ci) => {
+      wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle('566573'));
+    }); eR++;
+
+    Object.entries(outcomeCounts)
+      .sort((a, b) => b[1].count - a[1].count)
+      .forEach(([topic, { count, totalDur }], idx) => {
+        const pct = ((count / totalCalls) * 100).toFixed(1) + '%';
+        const avgDur = count > 0 ? Math.round(totalDur / count) : 0;
+        const alt = idx % 2 === 0 ? ROW_ALT : '';
+        wsE[enc({ c: 0, r: eR })] = cs(topic, alt ? bgStyle(alt) : dataStyle);
+        wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+        wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+        wsE[enc({ c: 3, r: eR })] = cn(avgDur, alt ? bgCStyle(alt) : dataCStyle);
+        eR++;
+      });
+
+    eR++; // blank spacer
+
+    // Hangup analysis
+    wsE[enc({ c: 0, r: eR })] = cs('HANGUP ANALYSIS', hdrStyle(DARK_SLATE));
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    ['HANGUP_SOURCE', 'HANGUP_REASON', 'Count', '% of Total'].forEach((h, ci) => {
+      wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle('566573'));
+    }); eR++;
+
+    Object.entries(hangupCounts)
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([key, cnt], idx) => {
+        const [src, rsn] = key.split('|||');
+        const pct = ((cnt / totalCalls) * 100).toFixed(1) + '%';
+        const alt = idx % 2 === 0 ? ROW_ALT : '';
+        wsE[enc({ c: 0, r: eR })] = cs(src, alt ? bgCStyle(alt) : dataCStyle);
+        wsE[enc({ c: 1, r: eR })] = cs(rsn, alt ? bgStyle(alt) : dataStyle);
+        wsE[enc({ c: 2, r: eR })] = cn(cnt, alt ? bgCStyle(alt) : dataCStyle);
+        wsE[enc({ c: 3, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+        eR++;
+      });
+
+    eR++; // blank spacer
+
+    // Bucket classification
+    wsE[enc({ c: 0, r: eR })] = cs('BUCKET CLASSIFICATION SUMMARY', hdrStyle(DARK_SLATE));
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    ['Bucket', 'Label', 'Definition', 'Call Count', '% of Unsuccessful'].forEach((h, ci) => {
+      wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle('566573'));
+    }); eR++;
+
+    [
+      { num: '1', label: 'Bucket 1 - New Workflow', def: 'User intent outside bot scope OR voicemail/IVR not detected', cnt: b1Count, accent: RED_BG, light: LIGHT_RED },
+      { num: '2', label: 'Bucket 2 - Logic Fix', def: 'Workflow exists but fails: loops, VAD errors, flow breaks', cnt: b2Count, accent: ORANGE_BG, light: LIGHT_ORANGE },
+      { num: '3', label: 'Bucket 3 - Script Update', def: "Flow works but script content doesn't convert", cnt: b3Count, accent: GREEN_BG, light: LIGHT_GREEN },
+    ].forEach(({ num, label, def, cnt, accent, light }) => {
+      const pct = unsuccessCount > 0 ? ((cnt / unsuccessCount) * 100).toFixed(1) + '%' : '0%';
+      wsE[enc({ c: 0, r: eR })] = cs(num, { font: mkFont(true, 9, WHITE), fill: mkFill(accent), alignment: mkAlign('center'), border: mkBorder() });
+      wsE[enc({ c: 1, r: eR })] = cs(label, bgStyle(light));
+      wsE[enc({ c: 2, r: eR })] = cs(def, { ...bgStyle(light), alignment: mkAlign('left', 'center', true) });
+      wsE[enc({ c: 3, r: eR })] = cn(cnt, bgCStyle(light));
+      wsE[enc({ c: 4, r: eR })] = cs(pct, bgCStyle(light));
+      eR++;
+    });
+
+    eR++; // blank spacer
+
+    // Prioritization roadmap
+    wsE[enc({ c: 0, r: eR })] = cs('PRIORITIZATION ROADMAP', hdrStyle(DARK_SLATE));
+    mE.push({ s: { c: 0, r: eR }, e: { c: 8, r: eR } }); eR++;
+
+    ['Priority', 'Category / Issue', 'Bucket', 'Call Count', 'Impact', 'Effort', 'Expected Lift', 'Approval'].forEach((h, ci) => {
+      wsE[enc({ c: ci, r: eR })] = cs(h, hdrStyle(DARK_SLATE));
+    }); eR++;
+
+    const allRecs: Array<{ rec: BucketRecommendation; bucket: string; light: string }> = [
+      ...analysisResult.recommendations.bucket1.map((r: BucketRecommendation) => ({ rec: r, bucket: '1', light: LIGHT_RED })),
+      ...analysisResult.recommendations.bucket2.map((r: BucketRecommendation) => ({ rec: r, bucket: '2', light: LIGHT_ORANGE })),
+      ...analysisResult.recommendations.bucket3.map((r: BucketRecommendation) => ({ rec: r, bucket: '3', light: LIGHT_GREEN })),
+    ].sort((a, b) => (b.rec.goalAlignmentScore || 0) - (a.rec.goalAlignmentScore || 0));
+
+    allRecs.forEach(({ rec, bucket, light }, idx) => {
+      const effort = rec.strategicPriority === 'Low' ? 'Low' : rec.strategicPriority === 'Medium' ? 'Medium' : 'High';
+      const lift = rec.goalAlignmentScore >= 8 ? '10-15%' : rec.goalAlignmentScore >= 6 ? '5-8%' : '2-5%';
+      wsE[enc({ c: 0, r: eR })] = cn(idx + 1, bgCStyle(light));
+      wsE[enc({ c: 1, r: eR })] = cs(rec.topic, bgStyle(light));
+      wsE[enc({ c: 2, r: eR })] = cs(`Bucket ${bucket}`, bgCStyle(light));
+      wsE[enc({ c: 3, r: eR })] = cn(rec.count || 0, bgCStyle(light));
+      wsE[enc({ c: 4, r: eR })] = cs(rec.strategicPriority, bgCStyle(light));
+      wsE[enc({ c: 5, r: eR })] = cs(effort, bgCStyle(light));
+      wsE[enc({ c: 6, r: eR })] = cs(lift, bgCStyle(light));
+      wsE[enc({ c: 7, r: eR })] = cs('Pending', bgCStyle(light));
+      eR++;
+    });
+
+    wsE['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 8, r: eR } });
+    wsE['!merges'] = mE;
+    wsE['!cols'] = [{ wch: 30 }, { wch: 18 }, { wch: 26 }, { wch: 26 }, { wch: 18 }, { wch: 12 }, { wch: 12 }, { wch: 15 }, { wch: 15 }];
+    wsE['!rows'] = [{ hpt: 28 }, { hpt: 20 }, { hpt: 16 }];
+
+    // =========================================================================
+    // SHEET 2 — Bucket 1 · New Workflow  (no nav row; starts at row 0)
+    // =========================================================================
+    const wsB1: any = {};
+    const mB1: any[] = [];
+    const b1Recs: BucketRecommendation[] = analysisResult.recommendations.bucket1;
+
+    wsB1[enc({ c: 0, r: 0 })] = cs(
+      `Bucket 1 — New Workflow / Missing Capabilities (${b1Count} calls)`,
+      { ...titleStyle, font: mkFont(true, 13, RED_BG) }
+    );
+    mB1.push({ s: { c: 0, r: 0 }, e: { c: 9, r: 0 } });
+
+    const b1Hdr = ['Priority', 'Missing Capability', 'Specific User Intent', 'Call Count', '% of Bucket 1', 'Transcript Excerpts', 'Business Impact', 'Recommended Workflow', 'Complexity', 'Approval Status'];
+    b1Hdr.forEach((h, ci) => { wsB1[enc({ c: ci, r: 2 })] = cs(h, hdrStyle(RED_BG)); });
+
+    b1Recs.forEach((rec, idx) => {
+      const r = idx + 3;
+      const pct = b1Count > 0 ? ((rec.count / b1Count) * 100).toFixed(1) + '%' : '0%';
+      const alt = idx % 2 === 0 ? LIGHT_RED : '';
+      wsB1[enc({ c: 0, r })] = cn(idx + 1, alt ? bgCStyle(alt) : dataCStyle);
+      wsB1[enc({ c: 1, r })] = cs(rec.topic, alt ? bgStyle(alt) : dataStyle);
+      wsB1[enc({ c: 2, r })] = cs(rec.problemStatement, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB1[enc({ c: 3, r })] = cn(rec.count || 0, alt ? bgCStyle(alt) : dataCStyle);
+      wsB1[enc({ c: 4, r })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+      wsB1[enc({ c: 5, r })] = cs(rec.examples.slice(0, 2).join(' | '), { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB1[enc({ c: 6, r })] = cs(rec.kpiToWatch, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB1[enc({ c: 7, r })] = cs(rec.recommendation, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB1[enc({ c: 8, r })] = cs(rec.strategicPriority, alt ? bgCStyle(alt) : dataCStyle);
+      wsB1[enc({ c: 9, r })] = cs('Pending', alt ? bgCStyle(alt) : dataCStyle);
+    });
+
+    const b1LastRow = 3 + b1Recs.length;
+    wsB1['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 9, r: b1LastRow } });
+    wsB1['!merges'] = mB1;
+    wsB1['!cols'] = [{ wch: 8 }, { wch: 24 }, { wch: 32 }, { wch: 12 }, { wch: 12 }, { wch: 45 }, { wch: 16 }, { wch: 40 }, { wch: 12 }, { wch: 15 }];
+
+    // =========================================================================
+    // SHEET 3 — Bucket 2 · Logic Fix  (no nav row; starts at row 0)
+    // =========================================================================
+    const wsB2: any = {};
+    const mB2: any[] = [];
+    const b2Recs: BucketRecommendation[] = analysisResult.recommendations.bucket2;
+
+    wsB2[enc({ c: 0, r: 0 })] = cs(
+      `Bucket 2 — Logic Fix / System Optimization (${b2Count} calls)`,
+      { ...titleStyle, font: mkFont(true, 13, ORANGE_BG) }
+    );
+    mB2.push({ s: { c: 0, r: 0 }, e: { c: 10, r: 0 } });
+
+    const b2Hdr = ['Priority', 'Affected Workflow', 'Issue Category', 'Call Count', '% of Bucket 2', 'Problem Description', 'Root Cause', 'Conv. Flow Excerpt', 'Recommended Fix', 'Complexity', 'Approval Status'];
+    b2Hdr.forEach((h, ci) => { wsB2[enc({ c: ci, r: 2 })] = cs(h, hdrStyle(ORANGE_BG)); });
+
+    b2Recs.forEach((rec, idx) => {
+      const r = idx + 3;
+      const pct = b2Count > 0 ? ((rec.count / b2Count) * 100).toFixed(1) + '%' : '0%';
+      const rootCause = (rec as any).rootCause || rec.problemStatement;
+      const alt = idx % 2 === 0 ? ORANGE_SOFT : '';
+      wsB2[enc({ c: 0, r })] = cn(idx + 1, alt ? bgCStyle(alt) : dataCStyle);
+      wsB2[enc({ c: 1, r })] = cs(rec.topic, alt ? bgStyle(alt) : dataStyle);
+      wsB2[enc({ c: 2, r })] = cs(rec.strategicPriority, alt ? bgCStyle(alt) : dataCStyle);
+      wsB2[enc({ c: 3, r })] = cn(rec.count || 0, alt ? bgCStyle(alt) : dataCStyle);
+      wsB2[enc({ c: 4, r })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+      wsB2[enc({ c: 5, r })] = cs(rec.problemStatement, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB2[enc({ c: 6, r })] = cs(rootCause, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB2[enc({ c: 7, r })] = cs(rec.examples.slice(0, 1).join(''), { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB2[enc({ c: 8, r })] = cs(rec.recommendation, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB2[enc({ c: 9, r })] = cs(rec.strategicPriority, alt ? bgCStyle(alt) : dataCStyle);
+      wsB2[enc({ c: 10, r })] = cs('Pending', alt ? bgCStyle(alt) : dataCStyle);
+    });
+
+    const b2TotalRow = 3 + b2Recs.length;
+    wsB2[enc({ c: 0, r: b2TotalRow })] = cs(
+      `✓ Total: ${b2Count} calls across ${b2Recs.length} categories`,
+      { font: mkFont(true, 9, GREEN_BG), alignment: mkAlign('left', 'center') }
+    );
+    mB2.push({ s: { c: 0, r: b2TotalRow }, e: { c: 10, r: b2TotalRow } });
+
+    wsB2['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 10, r: b2TotalRow } });
+    wsB2['!merges'] = mB2;
+    wsB2['!cols'] = [{ wch: 8 }, { wch: 26 }, { wch: 22 }, { wch: 12 }, { wch: 12 }, { wch: 38 }, { wch: 38 }, { wch: 42 }, { wch: 40 }, { wch: 12 }, { wch: 15 }];
+
+    // =========================================================================
+    // SHEET 4 — Bucket 3 · Script Update  (no nav row; starts at row 0)
+    // =========================================================================
+    const wsB3: any = {};
+    const mB3: any[] = [];
+    const b3Recs: BucketRecommendation[] = analysisResult.recommendations.bucket3;
+
+    wsB3[enc({ c: 0, r: 0 })] = cs(
+      `Bucket 3 — Script Update / Information Gaps (${b3Count} calls)`,
+      { ...titleStyle, font: mkFont(true, 13, GREEN_BG) }
+    );
+    mB3.push({ s: { c: 0, r: 0 }, e: { c: 10, r: 0 } });
+
+    const b3Hdr = ['Priority', 'Script Section (Issue Category)', 'Affected Workflow', 'Call Count', '% of Bucket 3', 'Content Gap', 'Transcript Excerpts', 'Current Bot Script', 'Recommended Script', 'Data Source', 'Approval Status'];
+    b3Hdr.forEach((h, ci) => { wsB3[enc({ c: ci, r: 2 })] = cs(h, hdrStyle(GREEN_BG)); });
+
+    b3Recs.forEach((rec, idx) => {
+      const r = idx + 3;
+      const pct = b3Count > 0 ? ((rec.count / b3Count) * 100).toFixed(1) + '%' : '0%';
+      const alt = idx % 2 === 0 ? LIGHT_GREEN : '';
+      wsB3[enc({ c: 0, r })] = cn(idx + 1, alt ? bgCStyle(alt) : dataCStyle);
+      wsB3[enc({ c: 1, r })] = cs(rec.topic, alt ? bgStyle(alt) : dataStyle);
+      wsB3[enc({ c: 2, r })] = cs('Voice Bot Workflow', alt ? bgStyle(alt) : dataStyle);
+      wsB3[enc({ c: 3, r })] = cn(rec.count || 0, alt ? bgCStyle(alt) : dataCStyle);
+      wsB3[enc({ c: 4, r })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
+      wsB3[enc({ c: 5, r })] = cs(rec.problemStatement, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB3[enc({ c: 6, r })] = cs(rec.examples.slice(0, 1).join(''), { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB3[enc({ c: 7, r })] = cs(rec.examples.slice(0, 1).join(''), { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB3[enc({ c: 8, r })] = cs(rec.recommendation, { ...(alt ? bgStyle(alt) : dataStyle), alignment: mkAlign('left', 'center', true) });
+      wsB3[enc({ c: 9, r })] = cs('AI Analysis', alt ? bgCStyle(alt) : dataCStyle);
+      wsB3[enc({ c: 10, r })] = cs('Pending', alt ? bgCStyle(alt) : dataCStyle);
+    });
+
+    const b3TotalRow = 3 + b3Recs.length;
+    wsB3[enc({ c: 0, r: b3TotalRow })] = cs(
+      `✓ Total: ${b3Count} calls across ${b3Recs.length} categories`,
+      { font: mkFont(true, 9, GREEN_BG), alignment: mkAlign('left', 'center') }
+    );
+    mB3.push({ s: { c: 0, r: b3TotalRow }, e: { c: 10, r: b3TotalRow } });
+
+    wsB3['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 10, r: b3TotalRow } });
+    wsB3['!merges'] = mB3;
+    wsB3['!cols'] = [{ wch: 8 }, { wch: 26 }, { wch: 24 }, { wch: 12 }, { wch: 12 }, { wch: 40 }, { wch: 44 }, { wch: 40 }, { wch: 44 }, { wch: 24 }, { wch: 15 }];
+
+    // =========================================================================
+    // SHEET 5 — Raw Data  (no nav row; header at row 0, data from row 1)
+    // =========================================================================
+    const wsRaw: any = {};
+    const mRaw: any[] = [];
+
+    // Title row
+    wsRaw[enc({ c: 0, r: 0 })] = cs(
+      `Raw Data — All ${totalCalls} Calls | Filter by Bucket #, Affected Workflow, or Issue Category`,
+      subtitleStyle
+    );
+    mRaw.push({ s: { c: 0, r: 0 }, e: { c: 14, r: 0 } });
+
+    // Header row
+    const rawHdr = ['Row #', 'CALL_ID', 'Call Outcome', 'Bucket #', 'Bucket Label', 'Affected Workflow', 'Issue Category', 'Category / Theme', 'Conv. Excerpt', 'Duration (s)', 'Hangup Reason', 'Hangup Source', 'Issue Description', 'Recording', 'Approval Status'];
+    rawHdr.forEach((h, ci) => { wsRaw[enc({ c: ci, r: 1 })] = cs(h, hdrStyle(DARK_SLATE)); });
+
+    // Data rows
+    rows.forEach((r: any, idx) => {
+      const rn = idx + 2;
+      const bkt = r.BUCKET || '0';
+      const rowBg = bkt === '1' ? LIGHT_RED : bkt === '2' ? LIGHT_ORANGE : bkt === '3' ? LIGHT_GREEN : '';
+      const rs = rowBg ? bgStyle(rowBg) : dataStyle;
+      const rc = rowBg ? bgCStyle(rowBg) : dataCStyle;
+      const rnS = rowBg ? { ...bgCStyle(rowBg), alignment: mkAlign('right', 'center') } : dataNumStyle;
+
+      const bktLabel = bkt === '1' ? 'Bucket 1 - New Workflow' : bkt === '2' ? 'Bucket 2 - Logic Fix' : bkt === '3' ? 'Bucket 3 - Script Update' : 'Resolved / Out of Scope';
+      const callOutcome = r.RESOLUTION_STATUS || r.HANGUP_REASON || 'N/A';
+      const convExcerpt = r.CONVERSATION_SUMMARY || r.USER_SUMMARY || 'N/A';
+      const issueDesc = r.BUCKET_LABEL || r.TOPIC || 'N/A';
+      const bktFontRgb = bkt === '1' ? RED_BG : bkt === '2' ? ORANGE_BG : bkt === '3' ? GREEN_BG : DARK_SLATE;
+
+      wsRaw[enc({ c: 0, r: rn })] = cn(idx + 1, rnS);
+      wsRaw[enc({ c: 1, r: rn })] = cs(r.CALL_ID || '', rs);
+      wsRaw[enc({ c: 2, r: rn })] = cs(callOutcome, { ...rs, alignment: mkAlign('left', 'center', true) });
+      wsRaw[enc({ c: 3, r: rn })] = cs(bkt, { ...rc, font: mkFont(true, 9, bktFontRgb) });
+      wsRaw[enc({ c: 4, r: rn })] = cs(bktLabel, rs);
+      wsRaw[enc({ c: 5, r: rn })] = cs(r.TOPIC || 'N/A', rs);
+      wsRaw[enc({ c: 6, r: rn })] = cs(r.TOPIC || 'N/A', rs);
+      wsRaw[enc({ c: 7, r: rn })] = cs(r.TOPIC || 'N/A', rs);
+      wsRaw[enc({ c: 8, r: rn })] = cs(convExcerpt, { ...rs, alignment: mkAlign('left', 'center', true) });
+      wsRaw[enc({ c: 9, r: rn })] = cn(Number(r.CALL_DURATION) || 0, rc);
+      wsRaw[enc({ c: 10, r: rn })] = cs(r.HANGUP_REASON || 'N/A', rc);
+      wsRaw[enc({ c: 11, r: rn })] = cs(r.HANGUP_SOURCE || 'N/A', rc);
+      wsRaw[enc({ c: 12, r: rn })] = cs(issueDesc, { ...rs, alignment: mkAlign('left', 'center', true) });
+      wsRaw[enc({ c: 13, r: rn })] = r.RECORDING_URL
+        ? { v: 'Open Recording', t: 's', s: linkStyle, l: { Target: r.RECORDING_URL } }
+        : cs('—', rc);
+      wsRaw[enc({ c: 14, r: rn })] = cs(r.APPROVAL_STATUS || 'Pending', rc);
+    });
+
+    wsRaw['!ref'] = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 14, r: 1 + rows.length } });
+    wsRaw['!merges'] = mRaw;
+    wsRaw['!cols'] = [{ wch: 6 }, { wch: 34 }, { wch: 28 }, { wch: 8 }, { wch: 22 }, { wch: 26 }, { wch: 22 }, { wch: 28 }, { wch: 50 }, { wch: 10 }, { wch: 20 }, { wch: 12 }, { wch: 40 }, { wch: 10 }, { wch: 15 }];
+
+    // =========================================================================
+    // Assemble & write via xlsx-js-style
+    // =========================================================================
+    const wb = SX.utils.book_new();
+    SX.utils.book_append_sheet(wb, wsE, 'Executive Summary');
+    SX.utils.book_append_sheet(wb, wsB1, 'Bucket 1 - New Workflow');
+    SX.utils.book_append_sheet(wb, wsB2, 'Bucket 2 - Logic Fix');
+    SX.utils.book_append_sheet(wb, wsB3, 'Bucket 3 - Script Update');
+    SX.utils.book_append_sheet(wb, wsRaw, 'Raw Data');
+
+    // Blob download — avoids Chrome "insecure download" warning
+    const vlOut = SX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const vlBlob = new Blob([vlOut], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const vlUrl = URL.createObjectURL(vlBlob);
+    const vlA = document.createElement('a');
+    vlA.href = vlUrl;
+    vlA.download = `${botTitle || botId || 'VoiceBot_Resolution_Analysis'}.xlsx`;
+    document.body.appendChild(vlA); vlA.click();
+    setTimeout(() => { URL.revokeObjectURL(vlUrl); document.body.removeChild(vlA); }, 1000);
+
   };
 
   const tabs = [

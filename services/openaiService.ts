@@ -55,7 +55,7 @@ export const analyzeWithOpenAI = async (
     // Priority: csvData > standardLogData > chatLogData
     const isStandardLog = csvData.length === 0 && standardLogData && standardLogData.length > 0;
     const isChatLog = csvData.length === 0 && (!standardLogData || standardLogData.length === 0) && chatLogData && chatLogData.length > 0;
-    const MAX_RECORDS = isChatLog ? 250 : 250;
+    const MAX_RECORDS = 250;
 
     // For Chat Logs: group individual messages by Session Id into conversations
     let groupedChatSessions: any[] = [];
