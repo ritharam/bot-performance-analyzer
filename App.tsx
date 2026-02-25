@@ -437,6 +437,36 @@ const App: React.FC = () => {
         return map.get(rec) ?? 0;
       };
 
+      // ── Row → Issue Category (strict whitelist, no fallback guessing) ─────────
+      // Valid Issue Category values are STRICTLY the rec.topic strings written into
+      // the bucket sheets. A row only gets an Issue Category if its ISSUE_CATEGORY
+      // field (stamped by the AI pipeline in batchAnalysisService) is present AND
+      // exists in that bucket's exact whitelist. No fuzzy matching, no fallbacks,
+      // no cross-bucket bleed. If unconfirmed → cell stays empty.
+
+      // Step 1: Build per-bucket whitelists from the actual rec.topic values
+      const validRecTopics: Record<string, Set<string>> = {
+        '1': new Set(analysisResult.recommendations.bucket1.map((r: BucketRecommendation) => r.topic)),
+        '2': new Set(analysisResult.recommendations.bucket2.map((r: BucketRecommendation) => r.topic)),
+        '3': new Set(analysisResult.recommendations.bucket3.map((r: BucketRecommendation) => r.topic)),
+      };
+
+      // Step 2: For each row, accept ISSUE_CATEGORY only if it is in that row's
+      // bucket's whitelist. Reject anything else — leave the cell blank.
+      const rowIssueCatMap = new Map<number, string>();
+      rows.forEach((r: any, idx: number) => {
+        const bkt = r.BUCKET || '0';
+        if (bkt !== '1' && bkt !== '2' && bkt !== '3') return; // not bucketed → skip
+        const allowed = validRecTopics[bkt];
+        if (!allowed || allowed.size === 0) return;
+        const ic = clean((r as any).ISSUE_CATEGORY);
+        // Only set if the value is exactly in the whitelist for THIS bucket
+        if (ic && allowed.has(ic)) {
+          rowIssueCatMap.set(idx, ic);
+        }
+        // No fallback — if unconfirmed, the cell will be empty
+      });
+
       const reportTitle = `${botTitle || 'Chat Bot'} — Resolution Analysis`;
       const analysisDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
       const generatedAt = `Generated on ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
@@ -793,16 +823,17 @@ const App: React.FC = () => {
       const wsRaw: any = {};
       const mRaw: any[] = [];
 
-      // Col count is now 11 (indices 0-10)
+      // Col count is now 10 (indices 0-9) — Resolution Status removed
       wsRaw[enc({ c: 0, r: 0 })] = plain(`Raw Data — All ${totalChats} Chats`);
-      mRaw.push({ s: { c: 0, r: 0 }, e: { c: 10, r: 0 } });
+      mRaw.push({ s: { c: 0, r: 0 }, e: { c: 9, r: 0 } });
 
-      const rawHdr = ['Row #', 'Chat URL', 'Chat Outcome', 'Bucket #', 'Bucket Label', 'Issue Category', 'Topic', 'User Query', 'Resolution', 'Resolution Status', 'User Sentiment'];
+      const rawHdr = ['Row #', 'Chat URL', 'Chat Outcome', 'Bucket #', 'Bucket Label', 'Issue Category', 'Topic', 'User Query', 'Resolution', 'User Sentiment'];
       rawHdr.forEach((h, ci) => { wsRaw[enc({ c: ci, r: 2 })] = cs(h, hdrStyle(DARK_SLATE)); });
 
       rows.forEach((r: any, idx) => {
         const rn  = idx + 3;
         const bkt = r.BUCKET || '0';
+        const isBucketed = bkt === '1' || bkt === '2' || bkt === '3';
         const rowBg     = bkt === '1' ? LIGHT_RED : bkt === '2' ? LIGHT_ORANGE : bkt === '3' ? LIGHT_GREEN : '';
         const rs        = rowBg ? bgStyle(rowBg)  : dataStyle;
         const rc        = rowBg ? bgCStyle(rowBg) : dataCStyle;
@@ -810,11 +841,11 @@ const App: React.FC = () => {
         const bktLabel  = bkt === '1' ? 'Bucket 1 - New Workflow Required'
                         : bkt === '2' ? 'Bucket 2 - Logic Fix Required'
                         : bkt === '3' ? 'Bucket 3 - KB / Script Update'
-                        : 'Resolved / Out of Scope';
+                        : '';
 
         const rowNumStyle = { font: mkFont(false, 9), fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('right', 'center'), border: mkBorder() };
         const urlLinkStyle = { font: { bold: false, sz: 9, name: 'Calibri', color: { rgb: '1155CC' }, underline: true }, fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('center', 'center'), border: mkBorder() };
-        const bktNumStyle = bkt !== '0'
+        const bktNumStyle = isBucketed
           ? { font: mkFont(true, 9, WHITE), fill: mkFill(bktAccent), alignment: mkAlign('center'), border: mkBorder() }
           : { font: mkFont(false, 9, DARK_SLATE), fill: noFillBase, alignment: mkAlign('center'), border: mkBorder() };
         const wrapRs = { font: mkFont(false, 9), fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
@@ -829,26 +860,30 @@ const App: React.FC = () => {
           clean(r.USER_SUMMARY)                 ||
           'No resolution recorded';                  // final human-readable fallback
 
+        // Issue Category — only valid values are the exact rec.topic strings from
+        // the bucket sheets. Uncategorised rows (bkt='0') get empty string.
+        const issueCategory = isBucketed ? (rowIssueCatMap.get(idx) || '') : '';
+
         wsRaw[enc({ c: 0,  r: rn })] = cn(idx + 1, rowNumStyle);
         if (r.CHATURL && clean(r.CHATURL)) {
           wsRaw[enc({ c: 1, r: rn })] = { v: 'Open Chat', t: 's', s: urlLinkStyle, l: { Target: r.CHATURL } };
         } else {
           wsRaw[enc({ c: 1, r: rn })] = cs('—', rc);
         }
-        wsRaw[enc({ c: 2,  r: rn })] = cs(cleanOr(r.RESOLUTION_STATUS, 'unknown'),         rs);
-        wsRaw[enc({ c: 3,  r: rn })] = cs(bkt === '0' ? '' : bkt,                          bktNumStyle);
-        wsRaw[enc({ c: 4,  r: rn })] = cs(bktLabel,                                        rs);
-        wsRaw[enc({ c: 5,  r: rn })] = cs(cleanOr(r.BUCKET_LABEL, cleanOr(r.TOPIC, '—')), rs);
-        wsRaw[enc({ c: 6,  r: rn })] = cs(cleanOr(r.TOPIC, '—'),                           rs);
-        wsRaw[enc({ c: 7,  r: rn })] = cs(cleanOr(r.USER_QUERY, '—'),                      wrapRs);
-        wsRaw[enc({ c: 8,  r: rn })] = cs(resolutionText,                                  wrapRs);
-        wsRaw[enc({ c: 9,  r: rn })] = cs(cleanOr(r.RESOLUTION_STATUS, 'unknown'),         rc);
-        wsRaw[enc({ c: 10, r: rn })] = cs(cleanOr(r.USER_SENTIMENT, '—'),                  rc);
+        wsRaw[enc({ c: 2,  r: rn })] = cs(cleanOr(r.RESOLUTION_STATUS, 'unknown'), rs);
+        // Bucket #, Bucket Label, Issue Category: empty for uncategorised rows
+        wsRaw[enc({ c: 3,  r: rn })] = cs(isBucketed ? bkt : '',                   bktNumStyle);
+        wsRaw[enc({ c: 4,  r: rn })] = cs(isBucketed ? bktLabel : '',              rs);
+        wsRaw[enc({ c: 5,  r: rn })] = cs(issueCategory,                           rs);
+        wsRaw[enc({ c: 6,  r: rn })] = cs(cleanOr(r.TOPIC, '—'),                   rs);
+        wsRaw[enc({ c: 7,  r: rn })] = cs(cleanOr(r.USER_QUERY, '—'),              wrapRs);
+        wsRaw[enc({ c: 8,  r: rn })] = cs(resolutionText,                          wrapRs);
+        wsRaw[enc({ c: 9,  r: rn })] = cs(cleanOr(r.USER_SENTIMENT, '—'),          rc);
       });
 
-      wsRaw['!ref']    = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 10, r: 2 + rows.length } });
+      wsRaw['!ref']    = SX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 9, r: 2 + rows.length } });
       wsRaw['!merges'] = mRaw;
-      wsRaw['!cols']   = [{ wch: 7 }, { wch: 18 }, { wch: 22 }, { wch: 9 }, { wch: 28 }, { wch: 28 }, { wch: 25 }, { wch: 45 }, { wch: 55 }, { wch: 20 }, { wch: 15 }];
+      wsRaw['!cols']   = [{ wch: 7 }, { wch: 18 }, { wch: 22 }, { wch: 9 }, { wch: 30 }, { wch: 30 }, { wch: 25 }, { wch: 45 }, { wch: 55 }, { wch: 15 }];
 
       // ── Assemble workbook & download via Blob (avoids Chrome HTTP warning) ──
       const wb = SX.utils.book_new();

@@ -13,6 +13,7 @@ export interface ConversationRow {
   USER_SENTIMENT: string;
   BUCKET?: string;
   BUCKET_LABEL?: string;
+  ISSUE_CATEGORY?: string;
   APPROVAL_STATUS: 'Yes' | 'No' | 'Pending';
   USER_SUMMARY?: string;
   BOT_SUMMARY?: string;
