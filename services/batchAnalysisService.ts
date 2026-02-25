@@ -447,6 +447,9 @@ export async function analyzeWithBatching(
         ) => {
             if (!bucketRecs || bucketRecs.length === 0) return;
 
+            // Valid topics in this bucket for whitelist validation
+            const validRecTopics = new Set(bucketRecs.map(r => r.topic));
+
             // Build a map from rec.topic → set of granular topics covered via rec.indices
             const recTopicToGranularTopics = new Map<string, Set<string>>();
             bucketRecs.forEach((rec: any) => {
@@ -461,12 +464,19 @@ export async function analyzeWithBatching(
             });
 
             // For each cluster topic assigned to this bucket, find the best rec.
-            // Skip topics already assigned via AI's issue_category field (most reliable).
             assignments.forEach(({ topic: clusterTopic, bucket }) => {
                 if (bucket !== bucketId) return;
                 const key = (clusterTopic || '').toLowerCase().trim();
                 if (!key) return;
-                // Already assigned from AI's issue_category — skip
+
+                // VALIDATE existing assignment from AI (topicToIssueCategory[key])
+                // If it doesn't exist in our actual bucketRecs, clear it to force recalculation
+                const existing = topicToIssueCategory[key];
+                if (existing && !validRecTopics.has(existing)) {
+                    delete topicToIssueCategory[key];
+                }
+
+                // If already assigned and valid — skip
                 if (topicToIssueCategory[key]) return;
 
                 // 1. Direct: a rec's indices covers a row with this exact TOPIC
@@ -478,7 +488,6 @@ export async function analyzeWithBatching(
                 }
 
                 // 2. Keyword similarity between cluster topic and each rec.topic
-                //    Score every word match + substring containment bonus
                 const clusterWords = new Set(key.split(/[\s_\-,]+/).filter((w: string) => w.length > 2));
                 let bestRec = '';
                 let bestScore = -1;
@@ -487,13 +496,9 @@ export async function analyzeWithBatching(
                     const recWords = recLower.split(/[\s_\-,]+/).filter((w: string) => w.length > 2);
                     let score = 0;
                     recWords.forEach((w: string) => { if (clusterWords.has(w)) score += 2; });
-                    // Substring containment: cluster topic appears inside rec topic name or vice versa
                     if (recLower.includes(key)) score += 3;
                     else if (key.includes(recLower.split(' ').slice(0, 2).join(' '))) score += 2;
-                    // Partial word overlap (stem matching)
-                    clusterWords.forEach((cw: string) => {
-                        if (recLower.includes(cw)) score += 1;
-                    });
+                    clusterWords.forEach((cw: string) => { if (recLower.includes(cw)) score += 1; });
                     if (score > bestScore) { bestScore = score; bestRec = rec.topic; }
                 });
 

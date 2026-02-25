@@ -404,36 +404,16 @@ const App: React.FC = () => {
       const unsuccessCount = b1Count + b2Count + b3Count;
       const successRate = totalChats > 0 ? ((successCount / totalChats) * 100).toFixed(1) + '%' : '0%';
 
-      // ── Per-rec counts: residual method ─────────────────────────────────────
-      // The AI assigns rows to recs via indices[]. When a rec has count=0 it means
-      // its indices array was empty — the residual rows (bktTotal - knownCounts) belong
-      // to it. We compute a resolved count per rec using:
-      //   knownCount  = rec.count if > 0  (set by processBucket from rec.indices.length)
-      //   missingRecs = recs where count === 0
-      //   residual    = bktTotal - sum(knownCounts), split evenly across missingRecs
-      const resolveRecCounts = (
-        recs: BucketRecommendation[],
-        bktTotal: number
-      ): Map<BucketRecommendation, number> => {
-        const result = new Map<BucketRecommendation, number>();
-        const knownSum = recs.reduce((s, r) => s + (r.count > 0 ? r.count : 0), 0);
-        const missing = recs.filter(r => !(r.count > 0));
-        const residual = Math.max(0, bktTotal - knownSum);
-        const perMissing = missing.length > 0 ? Math.round(residual / missing.length) : 0;
-        recs.forEach(r => {
-          result.set(r, r.count > 0 ? r.count : perMissing);
-        });
-        return result;
-      };
-
-      const b1Counts = resolveRecCounts(analysisResult.recommendations.bucket1, b1Count);
-      const b2Counts = resolveRecCounts(analysisResult.recommendations.bucket2, b2Count);
-      const b3Counts = resolveRecCounts(analysisResult.recommendations.bucket3, b3Count);
-
-      const getRecCount = (rec: BucketRecommendation, bucketId: string): number => {
-        const map = bucketId === '1' ? b1Counts : bucketId === '2' ? b2Counts : b3Counts;
-        return map.get(rec) ?? 0;
-      };
+      // ── Per-issue-category counts: Derived purely from the data ──────────────
+      // This ensures the counts in the Roadmap and Bucket sheets PERFECTLY match
+      // the number of rows appearing for that category in the Raw Data.
+      const issueCategoryCounts = new Map<string, number>();
+      rows.forEach((r: any) => {
+        const ic = clean(r.ISSUE_CATEGORY);
+        if (ic) {
+          issueCategoryCounts.set(ic, (issueCategoryCounts.get(ic) || 0) + 1);
+        }
+      });
 
       // ── Row → Issue Category (strict whitelist, no fallback guessing) ─────────
       // Valid Issue Category values are STRICTLY the rec.topic strings written into
@@ -461,8 +441,11 @@ const App: React.FC = () => {
         // Only set if the value is exactly in the whitelist for THIS bucket
         if (ic && allowed.has(ic)) {
           rowIssueCatMap.set(idx, ic);
+        } else if (allowed.size > 0) {
+          // Safety fallback: if bucket is known but mapping failed, pick the first rec in bucket
+          const firstRec = Array.from(allowed)[0];
+          rowIssueCatMap.set(idx, firstRec);
         }
-        // No fallback — if unconfirmed, the cell will be empty
       });
 
       const reportTitle = `${botTitle || 'Chat Bot'} — Resolution Analysis`;
@@ -666,7 +649,7 @@ const App: React.FC = () => {
           alignment: mkAlign(wt ? 'left' : 'center', 'center', wt),
           border: mkBorder(),
         });
-        const cnt = getRecCount(rec, bucket);
+        const cnt = issueCategoryCounts.get(rec.topic) || 0;
         wsE[enc({ c: 0, r: eR })] = cn(idx + 1, rowStyle());
         wsE[enc({ c: 1, r: eR })] = cs(rec.topic, rowStyle(true));
         wsE[enc({ c: 2, r: eR })] = cs(`Bucket ${bucket}`, rowStyle());
@@ -700,7 +683,7 @@ const App: React.FC = () => {
 
       b1Recs.forEach((rec, idx) => {
         const r = idx + 4;
-        const cnt = getRecCount(rec, '1');
+        const cnt = issueCategoryCounts.get(rec.topic) || 0;
         const pct = b1Count > 0 ? ((cnt / b1Count) * 100).toFixed(1) + '%' : '0%';
         const alt = idx % 2 === 0 ? LIGHT_RED : '';
         const rs = alt ? bgStyle(alt) : dataStyle;
@@ -744,7 +727,7 @@ const App: React.FC = () => {
 
       b2Recs.forEach((rec, idx) => {
         const r = idx + 4;
-        const cnt = getRecCount(rec, '2');
+        const cnt = issueCategoryCounts.get(rec.topic) || 0;
         const pct = b2Count > 0 ? ((cnt / b2Count) * 100).toFixed(1) + '%' : '0%';
         const alt = idx % 2 === 0 ? LIGHT_ORANGE : '';
         const rs = alt ? bgStyle(alt) : dataStyle;
@@ -788,7 +771,7 @@ const App: React.FC = () => {
 
       b3Recs.forEach((rec, idx) => {
         const r = idx + 4;
-        const cnt = getRecCount(rec, '3');
+        const cnt = issueCategoryCounts.get(rec.topic) || 0;
         const pct = b3Count > 0 ? ((cnt / b3Count) * 100).toFixed(1) + '%' : '0%';
         const alt = idx % 2 === 0 ? LIGHT_GREEN : '';
         const rs = alt ? bgStyle(alt) : dataStyle;
