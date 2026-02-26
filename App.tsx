@@ -393,60 +393,54 @@ const App: React.FC = () => {
       };
       const cleanOr = (v: any, fallback: string): string => clean(v) || fallback;
 
-      // ── Derived counts — computed directly from categorizedRows ──────────────
-      // Do NOT rely on rec.count (AI may return 0 for indices[]). Instead count
-      // how many rows in categorizedRows actually carry each bucket assignment.
-      const totalChats = rows.length;
-      const b1Count = rows.filter((r: any) => r.BUCKET === '1').length;
-      const b2Count = rows.filter((r: any) => r.BUCKET === '2').length;
-      const b3Count = rows.filter((r: any) => r.BUCKET === '3').length;
-      const successCount = rows.filter((r: any) => !r.BUCKET || r.BUCKET === '0').length;
-      const unsuccessCount = b1Count + b2Count + b3Count;
-      const successRate = totalChats > 0 ? ((successCount / totalChats) * 100).toFixed(1) + '%' : '0%';
-
-      // ── Per-issue-category counts: Derived purely from the data ──────────────
-      // This ensures the counts in the Roadmap and Bucket sheets PERFECTLY match
-      // the number of rows appearing for that category in the Raw Data.
-      const issueCategoryCounts = new Map<string, number>();
-      rows.forEach((r: any) => {
-        const ic = clean(r.ISSUE_CATEGORY);
-        if (ic) {
-          issueCategoryCounts.set(ic, (issueCategoryCounts.get(ic) || 0) + 1);
-        }
-      });
-
-      // ── Row → Issue Category (strict whitelist, no fallback guessing) ─────────
-      // Valid Issue Category values are STRICTLY the rec.topic strings written into
-      // the bucket sheets. A row only gets an Issue Category if its ISSUE_CATEGORY
-      // field (stamped by the AI pipeline in batchAnalysisService) is present AND
-      // exists in that bucket's exact whitelist. No fuzzy matching, no fallbacks,
-      // no cross-bucket bleed. If unconfirmed → cell stays empty.
-
-      // Step 1: Build per-bucket whitelists from the actual rec.topic values
-      const validRecTopics: Record<string, Set<string>> = {
+      // ── Step 1: Initialize whitelists from actual recommendations ───────────
+      const validRecTopics = {
         '1': new Set(analysisResult.recommendations.bucket1.map((r: BucketRecommendation) => r.topic)),
         '2': new Set(analysisResult.recommendations.bucket2.map((r: BucketRecommendation) => r.topic)),
         '3': new Set(analysisResult.recommendations.bucket3.map((r: BucketRecommendation) => r.topic)),
       };
 
-      // Step 2: For each row, accept ISSUE_CATEGORY only if it is in that row's
-      // bucket's whitelist. Reject anything else — leave the cell blank.
+      // ── Step 2: Unified Row Mapping Pass ────────────────────────────────────
+      // This single pass determines the correct Issue Category for every row
+      // and tracks the indices for perfectly synchronized counts and samples.
       const rowIssueCatMap = new Map<number, string>();
+      const topicToIndicesMap = new Map<string, number[]>();
+
       rows.forEach((r: any, idx: number) => {
         const bkt = r.BUCKET || '0';
-        if (bkt !== '1' && bkt !== '2' && bkt !== '3') return; // not bucketed → skip
-        const allowed = validRecTopics[bkt];
-        if (!allowed || allowed.size === 0) return;
-        const ic = clean((r as any).ISSUE_CATEGORY);
-        // Only set if the value is exactly in the whitelist for THIS bucket
-        if (ic && allowed.has(ic)) {
-          rowIssueCatMap.set(idx, ic);
-        } else if (allowed.size > 0) {
-          // Safety fallback: if bucket is known but mapping failed, pick the first rec in bucket
-          const firstRec = Array.from(allowed)[0];
-          rowIssueCatMap.set(idx, firstRec);
+        if (bkt === '1' || bkt === '2' || bkt === '3') {
+          const allowed = validRecTopics[bkt as '1' | '2' | '3'];
+          let ic = clean(r.ISSUE_CATEGORY);
+
+          // Validate or fallback
+          if (!ic || !allowed.has(ic)) {
+            ic = allowed.size > 0 ? (Array.from(allowed)[0] as string) : '';
+          }
+
+          if (ic) {
+            rowIssueCatMap.set(idx, ic);
+            const topicKey = String(ic);
+            if (!topicToIndicesMap.has(topicKey)) topicToIndicesMap.set(topicKey, []);
+            topicToIndicesMap.get(topicKey)!.push(idx);
+          }
         }
       });
+
+      // ── Step 3: Global Summary Counts (Synchronized) ────────────────────────
+      const totalChats = rows.length;
+      const b1Count = Array.from(topicToIndicesMap.entries())
+        .filter(([topic]) => validRecTopics['1'].has(topic))
+        .reduce((sum, [, idxs]) => sum + idxs.length, 0);
+      const b2Count = Array.from(topicToIndicesMap.entries())
+        .filter(([topic]) => validRecTopics['2'].has(topic))
+        .reduce((sum, [, idxs]) => sum + idxs.length, 0);
+      const b3Count = Array.from(topicToIndicesMap.entries())
+        .filter(([topic]) => validRecTopics['3'].has(topic))
+        .reduce((sum, [, idxs]) => sum + idxs.length, 0);
+
+      const unsuccessCount = b1Count + b2Count + b3Count;
+      const successCount = Math.max(0, totalChats - unsuccessCount);
+      const successRate = totalChats > 0 ? ((successCount / totalChats) * 100).toFixed(1) + '%' : '0%';
 
       const reportTitle = `${botTitle || 'Chat Bot'} — Resolution Analysis`;
       const analysisDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
@@ -540,12 +534,12 @@ const App: React.FC = () => {
       eR++;
 
       Object.entries(outcomeCounts)
-        .sort((a, b) => b[1] - a[1])
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
         .forEach(([status, count], idx) => {
-          const pct = totalChats > 0 ? ((count / totalChats) * 100).toFixed(1) + '%' : '0%';
+          const pct = totalChats > 0 ? (((count as number) / totalChats) * 100).toFixed(1) + '%' : '0%';
           const alt = idx % 2 === 0 ? ROW_ALT : '';
           wsE[enc({ c: 0, r: eR })] = cs(status, alt ? bgStyle(alt) : dataStyle);
-          wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+          wsE[enc({ c: 1, r: eR })] = cn(count as number, alt ? bgCStyle(alt) : dataCStyle);
           wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
           eR++;
         });
@@ -563,12 +557,12 @@ const App: React.FC = () => {
       eR++;
 
       Object.entries(sentimentCounts)
-        .sort((a, b) => b[1] - a[1])
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
         .forEach(([sentiment, count], idx) => {
-          const pct = totalChats > 0 ? ((count / totalChats) * 100).toFixed(1) + '%' : '0%';
+          const pct = totalChats > 0 ? (((count as number) / totalChats) * 100).toFixed(1) + '%' : '0%';
           const alt = idx % 2 === 0 ? ROW_ALT : '';
           wsE[enc({ c: 0, r: eR })] = cs(sentiment, alt ? bgStyle(alt) : dataStyle);
-          wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+          wsE[enc({ c: 1, r: eR })] = cn(count as number, alt ? bgCStyle(alt) : dataCStyle);
           wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
           eR++;
         });
@@ -586,13 +580,13 @@ const App: React.FC = () => {
       eR++;
 
       Object.entries(interactionTypes)
-        .sort((a, b) => b[1] - a[1])
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
         .slice(0, 5)
         .forEach(([type, count], idx) => {
-          const pct = totalChats > 0 ? ((count / totalChats) * 100).toFixed(1) + '%' : '0%';
+          const pct = totalChats > 0 ? (((count as number) / totalChats) * 100).toFixed(1) + '%' : '0%';
           const alt = idx % 2 === 0 ? ROW_ALT : '';
           wsE[enc({ c: 0, r: eR })] = cs(type, alt ? bgStyle(alt) : dataStyle);
-          wsE[enc({ c: 1, r: eR })] = cn(count, alt ? bgCStyle(alt) : dataCStyle);
+          wsE[enc({ c: 1, r: eR })] = cn(count as number, alt ? bgCStyle(alt) : dataCStyle);
           wsE[enc({ c: 2, r: eR })] = cs(pct, alt ? bgCStyle(alt) : dataCStyle);
           eR++;
         });
@@ -649,7 +643,7 @@ const App: React.FC = () => {
           alignment: mkAlign(wt ? 'left' : 'center', 'center', wt),
           border: mkBorder(),
         });
-        const cnt = issueCategoryCounts.get(rec.topic) || 0;
+        const cnt = topicToIndicesMap.get(rec.topic)?.length || 0;
         wsE[enc({ c: 0, r: eR })] = cn(idx + 1, rowStyle());
         wsE[enc({ c: 1, r: eR })] = cs(rec.topic, rowStyle(true));
         wsE[enc({ c: 2, r: eR })] = cs(`Bucket ${bucket}`, rowStyle());
@@ -682,25 +676,29 @@ const App: React.FC = () => {
       b1Hdr.forEach((h, ci) => { wsB1[enc({ c: ci, r: 3 })] = cs(h, hdrStyle(RED_BG)); });
 
       b1Recs.forEach((rec, idx) => {
-        const r = idx + 4;
-        const cnt = issueCategoryCounts.get(rec.topic) || 0;
+        const itemIndices = topicToIndicesMap.get(rec.topic) || [];
+        const cnt = itemIndices.length;
         const pct = b1Count > 0 ? ((cnt / b1Count) * 100).toFixed(1) + '%' : '0%';
+        const transcriptExcerpts = itemIndices.slice(0, 3).map(i => rows[i].USER_QUERY || '').join('\n• ');
+
+        const r = idx + 4;
         const alt = idx % 2 === 0 ? LIGHT_RED : '';
         const rs = alt ? bgStyle(alt) : dataStyle;
-        const rc = alt ? bgCStyle(alt) : dataCStyle;
+        const rcs = alt ? bgCStyle(alt) : dataCStyle;
         const wrapS = alt
           ? { font: mkFont(false, 9), fill: mkFill(alt), alignment: mkAlign('left', 'center', true), border: mkBorder() }
           : { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
-        wsB1[enc({ c: 0, r })] = cn(idx + 1, rc);
+
+        wsB1[enc({ c: 0, r })] = cn(idx + 1, rcs);
         wsB1[enc({ c: 1, r })] = cs(rec.topic, rs);
-        wsB1[enc({ c: 2, r })] = cn(cnt, rc);
-        wsB1[enc({ c: 3, r })] = cs(pct, rc);
+        wsB1[enc({ c: 2, r })] = cn(cnt, rcs);
+        wsB1[enc({ c: 3, r })] = cs(pct, rcs);
         wsB1[enc({ c: 4, r })] = cs(cleanOr(rec.problemStatement, '—'), wrapS);
         wsB1[enc({ c: 5, r })] = cs(cleanOr((rec as any).rootCause || rec.problemStatement, '—'), wrapS);
-        wsB1[enc({ c: 6, r })] = cs(rec.examples.slice(0, 2).map(clean).filter(Boolean).join(' | ') || '—', wrapS);
+        wsB1[enc({ c: 6, r })] = cs(transcriptExcerpts ? `• ${transcriptExcerpts}` : '—', wrapS);
         wsB1[enc({ c: 7, r })] = cs(cleanOr(rec.recommendation, '—'), wrapS);
-        wsB1[enc({ c: 8, r })] = cs(rec.strategicPriority, rc);
-        wsB1[enc({ c: 9, r })] = cs('Pending', rc);
+        wsB1[enc({ c: 8, r })] = cs(rec.strategicPriority, rcs);
+        wsB1[enc({ c: 9, r })] = cs('Pending', rcs);
       });
 
       const b1LastR = 4 + b1Recs.length;
@@ -726,25 +724,29 @@ const App: React.FC = () => {
       b2Hdr.forEach((h, ci) => { wsB2[enc({ c: ci, r: 3 })] = cs(h, hdrStyle(ORANGE_BG)); });
 
       b2Recs.forEach((rec, idx) => {
-        const r = idx + 4;
-        const cnt = issueCategoryCounts.get(rec.topic) || 0;
+        const itemIndices = topicToIndicesMap.get(rec.topic) || [];
+        const cnt = itemIndices.length;
         const pct = b2Count > 0 ? ((cnt / b2Count) * 100).toFixed(1) + '%' : '0%';
+        const transcriptExcerpts = itemIndices.slice(0, 3).map(i => rows[i].USER_QUERY || '').join('\n• ');
+
+        const r = idx + 4;
         const alt = idx % 2 === 0 ? LIGHT_ORANGE : '';
         const rs = alt ? bgStyle(alt) : dataStyle;
-        const rc = alt ? bgCStyle(alt) : dataCStyle;
+        const rcs = alt ? bgCStyle(alt) : dataCStyle;
         const wrapS = alt
           ? { font: mkFont(false, 9), fill: mkFill(alt), alignment: mkAlign('left', 'center', true), border: mkBorder() }
           : { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
-        wsB2[enc({ c: 0, r })] = cn(idx + 1, rc);
+
+        wsB2[enc({ c: 0, r })] = cn(idx + 1, rcs);
         wsB2[enc({ c: 1, r })] = cs(rec.topic, rs);
-        wsB2[enc({ c: 2, r })] = cn(cnt, rc);
-        wsB2[enc({ c: 3, r })] = cs(pct, rc);
+        wsB2[enc({ c: 2, r })] = cn(cnt, rcs);
+        wsB2[enc({ c: 3, r })] = cs(pct, rcs);
         wsB2[enc({ c: 4, r })] = cs(cleanOr(rec.problemStatement, '—'), wrapS);
         wsB2[enc({ c: 5, r })] = cs(cleanOr((rec as any).rootCause || rec.problemStatement, '—'), wrapS);
-        wsB2[enc({ c: 6, r })] = cs(rec.examples.slice(0, 2).map(clean).filter(Boolean).join(' | ') || '—', wrapS);
+        wsB2[enc({ c: 6, r })] = cs(transcriptExcerpts ? `• ${transcriptExcerpts}` : '—', wrapS);
         wsB2[enc({ c: 7, r })] = cs(cleanOr(rec.recommendation, '—'), wrapS);
-        wsB2[enc({ c: 8, r })] = cs(rec.strategicPriority, rc);
-        wsB2[enc({ c: 9, r })] = cs('Pending', rc);
+        wsB2[enc({ c: 8, r })] = cs(rec.strategicPriority, rcs);
+        wsB2[enc({ c: 9, r })] = cs('Pending', rcs);
       });
 
       const b2LastR = 4 + b2Recs.length;
@@ -770,25 +772,29 @@ const App: React.FC = () => {
       b3Hdr.forEach((h, ci) => { wsB3[enc({ c: ci, r: 3 })] = cs(h, hdrStyle(GREEN_BG)); });
 
       b3Recs.forEach((rec, idx) => {
-        const r = idx + 4;
-        const cnt = issueCategoryCounts.get(rec.topic) || 0;
+        const itemIndices = topicToIndicesMap.get(rec.topic) || [];
+        const cnt = itemIndices.length;
         const pct = b3Count > 0 ? ((cnt / b3Count) * 100).toFixed(1) + '%' : '0%';
+        const transcriptExcerpts = itemIndices.slice(0, 3).map(i => rows[i].USER_QUERY || '').join('\n• ');
+
+        const r = idx + 4;
         const alt = idx % 2 === 0 ? LIGHT_GREEN : '';
         const rs = alt ? bgStyle(alt) : dataStyle;
-        const rc = alt ? bgCStyle(alt) : dataCStyle;
+        const rcs = alt ? bgCStyle(alt) : dataCStyle;
         const wrapS = alt
           ? { font: mkFont(false, 9), fill: mkFill(alt), alignment: mkAlign('left', 'center', true), border: mkBorder() }
           : { font: mkFont(false, 9), fill: noFillBase, alignment: mkAlign('left', 'center', true), border: mkBorder() };
-        wsB3[enc({ c: 0, r })] = cn(idx + 1, rc);
+
+        wsB3[enc({ c: 0, r })] = cn(idx + 1, rcs);
         wsB3[enc({ c: 1, r })] = cs(rec.topic, rs);
-        wsB3[enc({ c: 2, r })] = cn(cnt, rc);
-        wsB3[enc({ c: 3, r })] = cs(pct, rc);
+        wsB3[enc({ c: 2, r })] = cn(cnt, rcs);
+        wsB3[enc({ c: 3, r })] = cs(pct, rcs);
         wsB3[enc({ c: 4, r })] = cs(cleanOr(rec.problemStatement, '—'), wrapS);
         wsB3[enc({ c: 5, r })] = cs(cleanOr((rec as any).rootCause || rec.problemStatement, '—'), wrapS);
-        wsB3[enc({ c: 6, r })] = cs(rec.examples.slice(0, 2).map(clean).filter(Boolean).join(' | ') || '—', wrapS);
+        wsB3[enc({ c: 6, r })] = cs(transcriptExcerpts ? `• ${transcriptExcerpts}` : '—', wrapS);
         wsB3[enc({ c: 7, r })] = cs(cleanOr(rec.recommendation, '—'), wrapS);
-        wsB3[enc({ c: 8, r })] = cs(rec.strategicPriority, rc);
-        wsB3[enc({ c: 9, r })] = cs('Pending', rc);
+        wsB3[enc({ c: 8, r })] = cs(rec.strategicPriority, rcs);
+        wsB3[enc({ c: 9, r })] = cs('Pending', rcs);
       });
 
       const b3LastR = 4 + b3Recs.length;
@@ -819,10 +825,10 @@ const App: React.FC = () => {
         const rs = rowBg ? bgStyle(rowBg) : dataStyle;
         const rc = rowBg ? bgCStyle(rowBg) : dataCStyle;
         const bktAccent = bkt === '1' ? RED_BG : bkt === '2' ? ORANGE_BG : bkt === '3' ? GREEN_BG : DARK_SLATE;
-        const bktLabel = bkt === '1' ? 'Bucket 1 - New Workflow Required'
+        const bktLabel = r.BUCKET_LABEL || (bkt === '1' ? 'Bucket 1 - New Workflow Required'
           : bkt === '2' ? 'Bucket 2 - Logic Fix Required'
             : bkt === '3' ? 'Bucket 3 - KB / Script Update'
-              : '';
+              : '');
 
         const rowNumStyle = { font: mkFont(false, 9), fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('right', 'center'), border: mkBorder() };
         const urlLinkStyle = { font: { bold: false, sz: 9, name: 'Calibri', color: { rgb: '1155CC' }, underline: true }, fill: rowBg ? mkFill(rowBg) : noFillBase, alignment: mkAlign('center', 'center'), border: mkBorder() };
@@ -841,9 +847,8 @@ const App: React.FC = () => {
           clean(r.USER_SUMMARY) ||
           'No resolution recorded';                  // final human-readable fallback
 
-        // Issue Category — only valid values are the exact rec.topic strings from
-        // the bucket sheets. Uncategorised rows (bkt='0') get empty string.
-        const issueCategory = isBucketed ? (rowIssueCatMap.get(idx) || '') : '';
+        // Issue Category — use the stamped value from analysis result
+        const issueCategory = isBucketed ? (r.ISSUE_CATEGORY || rowIssueCatMap.get(idx) || '') : '';
 
         wsRaw[enc({ c: 0, r: rn })] = cn(idx + 1, rowNumStyle);
         if (r.CHATURL && clean(r.CHATURL)) {
@@ -891,16 +896,17 @@ const App: React.FC = () => {
     if (isChatLog) {
       const wb = XLSX.utils.book_new();
       const fmtRecs = (recs: BucketRecommendation[]) => [
-        ["Topic", "Priority", "Score", "Problem Statement", "Recommendation", "KPI to Watch", "Examples"],
+        ["Issue Category", "Priority", "Score", "Problem Statement", "Recommendation", "KPI to Watch", "Examples"],
         ...recs.map(r => [r.topic, r.strategicPriority, r.goalAlignmentScore, r.problemStatement, r.recommendation, r.kpiToWatch, r.examples.join(' | ')])
       ];
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fmtRecs(analysisResult.recommendations.bucket1)), "1-Expansion");
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fmtRecs(analysisResult.recommendations.bucket2)), "2-Optimization");
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fmtRecs(analysisResult.recommendations.bucket3)), "3-KnowledgeGaps");
-      const auditHeader = ["Pillar", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"];
+      const auditHeader = ["Pillar", "Bucket Label", "Issue Category", "Topic", "Session ID", "Created Date", "Journey Step", "Source", "Medium", "Language", "Message", "Translated Message", "Feedback"];
       const auditRows = rows.map((r: any) => {
         const bn = r.BUCKET === '1' ? 'EXPANSION' : r.BUCKET === '2' ? 'OPTIMIZE' : r.BUCKET === '3' ? 'GAPS' : 'RESOLVED';
-        return [bn, r.TOPIC, r['Session Id'], r['Created Date'], r['Journey:Step'], r['Source'], r['Interaction medium'], r['Language'], r['Message'], r['Translated message'], r['Feedback']];
+        const bktLabel = r.BUCKET_LABEL || (r.BUCKET === '1' ? 'Service Expansion (New Agent)' : r.BUCKET === '2' ? 'System Optimization (Logic Update)' : r.BUCKET === '3' ? 'Information Gaps (KB Update)' : 'Resolved / Out of Scope');
+        return [bn, bktLabel, r.ISSUE_CATEGORY || '', r.TOPIC, r['Session Id'], r['Created Date'], r['Journey:Step'], r['Source'], r['Interaction medium'], r['Language'], r['Message'], r['Translated message'], r['Feedback']];
       });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([auditHeader, ...auditRows]), "Full Audit Log");
       const clOut = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
@@ -1360,7 +1366,7 @@ const App: React.FC = () => {
       const rc = rowBg ? bgCStyle(rowBg) : dataCStyle;
       const rnS = rowBg ? { ...bgCStyle(rowBg), alignment: mkAlign('right', 'center') } : dataNumStyle;
 
-      const bktLabel = bkt === '1' ? 'Bucket 1 - New Workflow' : bkt === '2' ? 'Bucket 2 - Logic Fix' : bkt === '3' ? 'Bucket 3 - Script Update' : 'Resolved / Out of Scope';
+      const bktLabel = r.BUCKET_LABEL || (bkt === '1' ? 'Bucket 1 - New Workflow' : bkt === '2' ? 'Bucket 2 - Logic Fix' : bkt === '3' ? 'Bucket 3 - Script Update' : 'Resolved / Out of Scope');
       const callOutcome = r.RESOLUTION_STATUS || r.HANGUP_REASON || 'N/A';
       const convExcerpt = r.CONVERSATION_SUMMARY || r.USER_SUMMARY || 'N/A';
       const issueDesc = r.BUCKET_LABEL || r.TOPIC || 'N/A';
@@ -1372,7 +1378,7 @@ const App: React.FC = () => {
       wsRaw[enc({ c: 3, r: rn })] = cs(bkt, { ...rc, font: mkFont(true, 9, bktFontRgb) });
       wsRaw[enc({ c: 4, r: rn })] = cs(bktLabel, rs);
       wsRaw[enc({ c: 5, r: rn })] = cs(r.TOPIC || 'N/A', rs);
-      wsRaw[enc({ c: 6, r: rn })] = cs(r.TOPIC || 'N/A', rs);
+      wsRaw[enc({ c: 6, r: rn })] = cs(r.ISSUE_CATEGORY || r.TOPIC || 'N/A', rs);
       wsRaw[enc({ c: 7, r: rn })] = cs(r.TOPIC || 'N/A', rs);
       wsRaw[enc({ c: 8, r: rn })] = cs(convExcerpt, { ...rs, alignment: mkAlign('left', 'center', true) });
       wsRaw[enc({ c: 9, r: rn })] = cn(Number(r.CALL_DURATION) || 0, rc);
@@ -1643,10 +1649,8 @@ const BucketListView: React.FC<{ recs: BucketRecommendation[]; activeTab: string
   <div className={`${isReport ? 'space-y-4' : 'space-y-12'}`}>
     {recs.length === 0 && isReport && (<div className="p-8 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200"><p className="text-[9px] font-black uppercase text-slate-300">No issues identified</p></div>)}
     {recs.map((rec, i) => {
-      // CRITICAL FIX: Dynamically calculate count from data indices to ensure raw audit match
-      const actualCount = Array.isArray((rec as any).indices)
-        ? (rec as any).indices.filter((idx: number) => categorizedRows[idx]).length
-        : rec.count;
+      // UNIVERSAL SYNC: Derive count from the row-level ISSUE_CATEGORY mapping
+      const actualCount = categorizedRows.filter((r: any) => r.ISSUE_CATEGORY === rec.topic).length;
 
       return (
         <div key={i} className={`${isReport ? 'p-4 rounded-xl border-l-4' : 'p-12 rounded-[3.5rem] border-l-[16px]'} bg-slate-50 shadow-sm border-slate-200 ${activeTab === 'bucket1' ? 'border-rose-500' : activeTab === 'bucket2' ? 'border-amber-500' : 'border-emerald-500'}`}>

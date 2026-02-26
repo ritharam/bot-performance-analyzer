@@ -122,16 +122,21 @@ export function getFailureRows(
 
         const isUnresolved = status === 'unresolved';
         const isDropOff = status === 'user_drop_off';
+        const isAttempted = status === 'resolution_attempted';
+        const isPartial = status === 'partially_resolved';
         const isNegative = sentiment === 'negative';
 
-        if (isNegative || isUnresolved || isDropOff) {
+        // BROADENED: include partials and attempted resolutions as failure candidates
+        if (isNegative || isUnresolved || isDropOff || isAttempted || isPartial) {
             if (!seen.has(idx)) {
                 seen.add(idx);
                 // Lower sort key = higher priority
-                // negative=0, unresolved=1, user_drop_off=2
-                let sortKey = 2;
+                // Priority: Negative > Unresolved > Drop-off > Partial > Attempted
+                let sortKey = 4;
                 if (isNegative) sortKey = 0;
                 else if (isUnresolved) sortKey = 1;
+                else if (isDropOff) sortKey = 2;
+                else if (isPartial) sortKey = 3;
 
                 result.push({ row, originalIndex: idx, _sortKey: sortKey });
             }

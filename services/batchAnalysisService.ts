@@ -151,7 +151,7 @@ Buckets:
 - "1" = Service Expansion: no handler exists, new intent/flow needed
 - "2" = System Optimization: handler exists but logic is broken or incomplete
 - "3" = Information Gaps: handler exists but returns wrong or missing data
-- "0" = Resolved: failure_rate below 15% and negative_rate below 10%
+- "0" = Resolved: failure_rate below 5% and negative_rate below 5% (be proactive in identifying gaps even for mostly successful topics)
 
 Return valid JSON only:
 {
@@ -272,9 +272,10 @@ export async function analyzeWithBatching(
 
         const allClusters = buildClusterSummaries(csvData);
         log.totalClustersGenerated = allClusters.length;
-        const top20Clusters = allClusters.slice(0, 20);
-        log.topClustersSelected = top20Clusters.length;
-        log.clustersDropped = Math.max(0, allClusters.length - 20);
+        // INCREASED coverage: send top 100 clusters instead of 20
+        const topClusters = allClusters.slice(0, 100);
+        log.topClustersSelected = topClusters.length;
+        log.clustersDropped = Math.max(0, allClusters.length - 100);
 
         log.clusterDetails = allClusters.map((c, i) => ({
             rank: i + 1,
@@ -282,7 +283,7 @@ export async function analyzeWithBatching(
             total: c.total,
             failure_rate: c.failure_rate,
             negative_rate: c.negative_rate,
-            sentToAI: i < 20
+            sentToAI: i < 100
         }));
 
         // ── Stage 2: Strategic API call ───────────────────────────────────────────
@@ -294,7 +295,7 @@ export async function analyzeWithBatching(
         });
 
         const strategicStartTime = Date.now();
-        const strategicPrompt = buildStrategicPrompt(top20Clusters, botSummary, goals, csvData);
+        const strategicPrompt = buildStrategicPrompt(topClusters, botSummary, goals, csvData);
         let strategicRaw = "";
         let strategicSuccess = false;
         let strategicError = "";
@@ -309,7 +310,7 @@ export async function analyzeWithBatching(
 
         log.batchSummary.push({
             batchName: "Stage 2: Strategic Mapping",
-            inputSize: top20Clusters.length,
+            inputSize: topClusters.length,
             tokenEstimate: strategicPrompt.length / 4, // Rough estimate
             durationMs: Date.now() - strategicStartTime,
             success: strategicSuccess,
@@ -345,7 +346,8 @@ export async function analyzeWithBatching(
         });
 
         // ── Stage 3: Detail API call ──────────────────────────────────────────────
-        const failureEntry = getFailureRows(csvData, 150);
+        // INCREASED sampling: 500 rows instead of 150
+        const failureEntry = getFailureRows(csvData, 500);
 
         onProgress({
             currentBatch: 2,
@@ -565,7 +567,7 @@ export async function analyzeWithBatching(
         return {
             categorizedRows,
             recommendations: { bucket1, bucket2, bucket3 },
-            clusterSummaries: top20Clusters,
+            clusterSummaries: topClusters,
             totalRowsProcessed: csvData.length,
             analysisLog: log
         };
