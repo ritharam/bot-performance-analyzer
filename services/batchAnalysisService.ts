@@ -121,19 +121,22 @@ async function callAI(prompt: string, model: ModelOption, apiKey: string): Promi
 // ---------------------------------------------------------------------------
 
 function buildStrategicPrompt(
-    top20Clusters: ReturnType<typeof buildClusterSummaries>,
+    clusters: ReturnType<typeof buildClusterSummaries>,
     botSummary: string,
     goals: string,
-    csvData: ConversationRow[]
+    csvData: ConversationRow[],
+    batchNumber: number,
+    totalBatches: number
 ): string {
     return `Act as a senior Chatbot Performance Strategist.
 
 BUSINESS GOALS: "${goals}"
 
-BOT SUMMARY: ${botSummary.slice(0, 5000)}
+BOT SUMMARY: ${botSummary.slice(0, 3000)}
 
-DATASET: ${csvData.length} total conversations. Below are the top 20 failure topic clusters (sorted by failure rate):
-${JSON.stringify(top20Clusters.map(c => ({
+DATASET: ${csvData.length} total conversations. Below are ${clusters.length} topic clusters (Batch ${batchNumber} of ${totalBatches}, ranked by conversation volume — Rank 1 has most conversations):
+${JSON.stringify(clusters.map(c => ({
+        rank: c.rank,
         topic: c.topic,
         total: c.total,
         failure_rate: Math.round(c.failure_rate * 100) + '%',
@@ -143,7 +146,7 @@ ${JSON.stringify(top20Clusters.map(c => ({
         sample_queries: c.sample_queries
     })))}
 
-TASK: For each topic cluster, assign it to a bucket and return full recommendations.
+TASK: For each topic cluster, assign it to a bucket and return full recommendations. Prioritise clusters with higher conversation counts (lower rank number) as they impact more users.
 
 Buckets:
 - "1" = Service Expansion: no handler exists, new intent/flow needed
@@ -205,38 +208,77 @@ function mergeRecommendations(
     for (const rec of [...strategic, ...detail]) {
         const key = (rec.topic || '').toLowerCase().trim();
         const existing = map.get(key);
-        if (!existing || (rec.goalAlignmentScore || 0) > (existing.goalAlignmentScore || 0)) {
+        if (!existing) {
             map.set(key, rec);
+        } else {
+            // Keep the version with more conversations; break ties by goalAlignmentScore
+            const existingCount = (existing as any).count || 0;
+            const recCount = (rec as any).count || 0;
+            if (
+                recCount > existingCount ||
+                (recCount === existingCount && (rec.goalAlignmentScore || 0) > (existing.goalAlignmentScore || 0))
+            ) {
+                map.set(key, rec);
+            }
         }
     }
 
-    return Array.from(map.values()).sort(
-        (a, b) => (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0)
-    );
+    // Sort by count descending first, then goalAlignmentScore descending
+    return Array.from(map.values()).sort((a, b) => {
+        const countDiff = ((b as any).count || 0) - ((a as any).count || 0);
+        if (countDiff !== 0) return countDiff;
+        return (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0);
+    });
 }
 
 function processBucket(
     recs: any[],
     categorizedRows: ConversationRow[],
     bucketId: string,
-    label: string
+    label: string,
+    clustersByTopic?: Map<string, number[]>
 ): BucketRecommendation[] {
     (recs || []).forEach((rec) => {
-        if (Array.isArray(rec.indices)) {
-            rec.indices = rec.indices.filter(
+        // Start with LLM-provided indices, filter to valid range
+        const llmIndices: number[] = Array.isArray(rec.indices)
+            ? rec.indices.filter(
                 (idx: number) =>
                     Number.isInteger(idx) && idx >= 0 && idx < categorizedRows.length
-            );
-            rec.count = rec.indices.length;
-            rec.indices.forEach((idx: number) => {
-                categorizedRows[idx].BUCKET = bucketId;
-                categorizedRows[idx].BUCKET_LABEL = label;
+            )
+            : [];
+
+        // Expand coverage: also include all row_indices for any cluster topic the LLM
+        // mentioned in this rec's topic string — maximises conversation count
+        const expandedSet = new Set<number>(llmIndices);
+        if (clustersByTopic && rec.topic) {
+            const recTopicLower = (rec.topic || '').toLowerCase().trim();
+            clustersByTopic.forEach((indices, clusterTopic) => {
+                // Include cluster rows if the cluster topic contains or overlaps with rec topic
+                if (
+                    clusterTopic.includes(recTopicLower) ||
+                    recTopicLower.includes(clusterTopic)
+                ) {
+                    indices.forEach((idx) => {
+                        if (idx >= 0 && idx < categorizedRows.length) expandedSet.add(idx);
+                    });
+                }
             });
         }
+
+        rec.indices = Array.from(expandedSet);
+        rec.count = rec.indices.length;
+        rec.indices.forEach((idx: number) => {
+            categorizedRows[idx].BUCKET = bucketId;
+            categorizedRows[idx].BUCKET_LABEL = label;
+        });
     });
-    return (recs || []).sort(
-        (a: any, b: any) => (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0)
-    );
+
+    // Sort by count descending first (max conversation coverage), then by goalAlignmentScore
+    return (recs || []).sort((a: any, b: any) => {
+        const countDiff = (b.count || 0) - (a.count || 0);
+        if (countDiff !== 0) return countDiff;
+        return (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +301,11 @@ export async function analyzeWithBatching(
     log.csvFilteredOut = originalCsvStats?.filteredOut || 0;
     log.filterStatuses = originalCsvStats?.filterStatuses || [];
 
+    // Batch size for strategic cluster processing — keeps token usage manageable
+    const CLUSTER_BATCH_SIZE = 25;
+    // Maximum clusters ranked by conversation count to send to AI
+    const TOP_N_CLUSTERS = 50;
+
     try {
         // ── Stage 1: Clustering (pure TS, no API) ─────────────────────────────────
         onProgress({
@@ -268,58 +315,102 @@ export async function analyzeWithBatching(
             message: `Building topic clusters from ${csvData.length} rows...`,
         });
 
+        // buildClusterSummaries now sorts by total (conversation count) descending
+        // and assigns rank (rank 1 = highest conversation count)
         const allClusters = buildClusterSummaries(csvData);
         log.totalClustersGenerated = allClusters.length;
-        const top20Clusters = allClusters.slice(0, 20);
-        log.topClustersSelected = top20Clusters.length;
-        log.clustersDropped = Math.max(0, allClusters.length - 20);
 
-        log.clusterDetails = allClusters.map((c, i) => ({
-            rank: i + 1,
+        // Pick top 50 clusters by conversation count (rank 1..50)
+        const top50Clusters = allClusters.slice(0, TOP_N_CLUSTERS);
+        log.topClustersSelected = top50Clusters.length;
+        log.clustersDropped = Math.max(0, allClusters.length - TOP_N_CLUSTERS);
+
+        log.clusterDetails = allClusters.map((c) => ({
+            rank: c.rank,
             topic: c.topic,
             total: c.total,
             failure_rate: c.failure_rate,
             negative_rate: c.negative_rate,
-            sentToAI: i < 20
+            sentToAI: c.rank <= TOP_N_CLUSTERS,
         }));
 
-        // ── Stage 2: Strategic API call ───────────────────────────────────────────
+        // ── Stage 2: Strategic API calls (batched over top-50 clusters) ───────────
+        // Split top-50 into batches of CLUSTER_BATCH_SIZE to keep prompts manageable
+        const clusterBatches: typeof top50Clusters[] = [];
+        for (let i = 0; i < top50Clusters.length; i += CLUSTER_BATCH_SIZE) {
+            clusterBatches.push(top50Clusters.slice(i, i + CLUSTER_BATCH_SIZE));
+        }
+        const totalStrategicBatches = clusterBatches.length;
+
         onProgress({
             currentBatch: 1,
-            totalBatches: 2,
+            totalBatches: 1 + totalStrategicBatches + 1, // clustering + strategic batches + detail
             stage: 'strategic',
-            message: 'Mapping improvement areas...',
+            message: `Mapping improvement areas across ${top50Clusters.length} clusters in ${totalStrategicBatches} batch(es)...`,
         });
 
-        const strategicStartTime = Date.now();
-        const strategicPrompt = buildStrategicPrompt(top20Clusters, botSummary, goals, csvData);
-        let strategicRaw = "";
-        let strategicSuccess = false;
-        let strategicError = "";
+        // Accumulated parsed results across all strategic batches
+        const mergedStrategicParsed: {
+            topic_assignments: any[];
+            bucket1: any[];
+            bucket2: any[];
+            bucket3: any[];
+        } = { topic_assignments: [], bucket1: [], bucket2: [], bucket3: [] };
 
-        try {
-            strategicRaw = await callAI(strategicPrompt, model, apiKey);
-            strategicSuccess = true;
-        } catch (e: any) {
-            strategicError = e.message || String(e);
-            log.errors.push(`Stage 2 (Strategic) API Error: ${strategicError}`);
+        for (let bIdx = 0; bIdx < clusterBatches.length; bIdx++) {
+            const batch = clusterBatches[bIdx];
+            const batchNum = bIdx + 1;
+            const strategicStartTime = Date.now();
+            const strategicPrompt = buildStrategicPrompt(batch, botSummary, goals, csvData, batchNum, totalStrategicBatches);
+            let strategicRaw = "";
+            let strategicSuccess = false;
+            let strategicError = "";
+
+            try {
+                strategicRaw = await callAI(strategicPrompt, model, apiKey);
+                strategicSuccess = true;
+            } catch (e: any) {
+                strategicError = e.message || String(e);
+                log.errors.push(`Stage 2 Batch ${batchNum} (Strategic) API Error: ${strategicError}`);
+            }
+
+            log.batchSummary.push({
+                batchName: `Stage 2 Batch ${batchNum}/${totalStrategicBatches}: Strategic Mapping (clusters ${(bIdx * CLUSTER_BATCH_SIZE) + 1}–${Math.min((bIdx + 1) * CLUSTER_BATCH_SIZE, top50Clusters.length)})`,
+                inputSize: batch.length,
+                tokenEstimate: strategicPrompt.length / 4,
+                durationMs: Date.now() - strategicStartTime,
+                success: strategicSuccess,
+                errorMessage: strategicError || undefined,
+            });
+
+            // Mark which batch each cluster was sent in
+            batch.forEach(c => {
+                const detail = log.clusterDetails.find(d => d.topic === c.topic);
+                if (detail) detail.batchNumber = batchNum;
+            });
+
+            const batchParsed = safeJsonParse<any>(strategicRaw, {
+                topic_assignments: [],
+                bucket1: [],
+                bucket2: [],
+                bucket3: [],
+            });
+
+            // Merge this batch's results into the accumulated object
+            mergedStrategicParsed.topic_assignments.push(...(batchParsed.topic_assignments || []));
+            mergedStrategicParsed.bucket1.push(...(batchParsed.bucket1 || []));
+            mergedStrategicParsed.bucket2.push(...(batchParsed.bucket2 || []));
+            mergedStrategicParsed.bucket3.push(...(batchParsed.bucket3 || []));
+
+            onProgress({
+                currentBatch: 1 + batchNum,
+                totalBatches: 1 + totalStrategicBatches + 1,
+                stage: 'strategic',
+                message: `Strategic batch ${batchNum}/${totalStrategicBatches} complete...`,
+            });
         }
 
-        log.batchSummary.push({
-            batchName: "Stage 2: Strategic Mapping",
-            inputSize: top20Clusters.length,
-            tokenEstimate: strategicPrompt.length / 4, // Rough estimate
-            durationMs: Date.now() - strategicStartTime,
-            success: strategicSuccess,
-            errorMessage: strategicError || undefined
-        });
-
-        const strategicParsed = safeJsonParse<any>(strategicRaw, {
-            topic_assignments: [],
-            bucket1: [],
-            bucket2: [],
-            bucket3: [],
-        });
+        const strategicParsed = mergedStrategicParsed;
 
         // Build topic → bucket/label maps from AI response
         const topicToBucket: Record<string, string> = {};
@@ -346,8 +437,8 @@ export async function analyzeWithBatching(
         const failureEntry = getFailureRows(csvData, 150);
 
         onProgress({
-            currentBatch: 2,
-            totalBatches: 2,
+            currentBatch: 1 + totalStrategicBatches,
+            totalBatches: 1 + totalStrategicBatches + 1,
             stage: 'detail',
             message: 'Preparing smart recommendations...',
         });
@@ -383,8 +474,8 @@ export async function analyzeWithBatching(
 
         // ── Stage 4: Merging ──────────────────────────────────────────────────────
         onProgress({
-            currentBatch: 2,
-            totalBatches: 2,
+            currentBatch: 1 + totalStrategicBatches + 1,
+            totalBatches: 1 + totalStrategicBatches + 1,
             stage: 'merging',
             message: `Merging results across all ${csvData.length} rows...`,
         });
@@ -417,14 +508,20 @@ export async function analyzeWithBatching(
             .filter(c => !topicToBucket[(c.topic || '').toLowerCase().trim()])
             .map(c => c.topic);
 
-        // Apply detail overrides: for rows referenced in detail bucket recs, override BUCKET/BUCKET_LABEL
-        const strategicBucket1 = processBucket(strategicParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)');
-        const strategicBucket2 = processBucket(strategicParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)');
-        const strategicBucket3 = processBucket(strategicParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)');
+        // Build a topic → row_indices map from top50 clusters for coverage expansion
+        const clustersByTopic = new Map<string, number[]>();
+        top50Clusters.forEach((c) => {
+            clustersByTopic.set((c.topic || '').toLowerCase().trim(), c.row_indices);
+        });
 
-        const detailBucket1 = processBucket(detailParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)');
-        const detailBucket2 = processBucket(detailParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)');
-        const detailBucket3 = processBucket(detailParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)');
+        // Apply strategic and detail bucket assignments, using cluster map to maximise conversation coverage
+        const strategicBucket1 = processBucket(strategicParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)', clustersByTopic);
+        const strategicBucket2 = processBucket(strategicParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)', clustersByTopic);
+        const strategicBucket3 = processBucket(strategicParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)', clustersByTopic);
+
+        const detailBucket1 = processBucket(detailParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)', clustersByTopic);
+        const detailBucket2 = processBucket(detailParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)', clustersByTopic);
+        const detailBucket3 = processBucket(detailParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)', clustersByTopic);
 
         // Merge strategic + detail for each bucket, de-duping by topic (higher score wins)
         const bucket1 = mergeRecommendations(strategicBucket1, detailBucket1);
@@ -509,20 +606,69 @@ export async function analyzeWithBatching(
         buildIssueCategoryMap(bucket2, '2', categorizedRows);
         buildIssueCategoryMap(bucket3, '3', categorizedRows);
 
-        // Now stamp ISSUE_CATEGORY onto every categorized row
-        categorizedRows.forEach((row) => {
-            const key = (row.TOPIC || '').toLowerCase().trim();
-            if (row.BUCKET && row.BUCKET !== '0') {
-                const issueCategory = topicToIssueCategory[key];
-                if (issueCategory) {
-                    (row as any).ISSUE_CATEGORY = issueCategory;
-                } else {
-                    // Bucket is known but no rec mapping — use the bucket's primary rec topic
-                    const bktRecs = row.BUCKET === '1' ? bucket1 : row.BUCKET === '2' ? bucket2 : bucket3;
-                    if (bktRecs && bktRecs.length > 0) {
-                        (row as any).ISSUE_CATEGORY = bktRecs[0].topic;
+        // Build a reverse index: for each bucket, map rowIndex → rec.topic
+        // This covers rows that landed in a bucket via processBucket index expansion
+        // but whose TOPIC never appeared in the AI's topic_assignments
+        const rowIndexToIssueCategory = new Map<number, string>();
+        [
+            { recs: bucket1 },
+            { recs: bucket2 },
+            { recs: bucket3 },
+        ].forEach(({ recs }) => {
+            recs.forEach((rec: any) => {
+                if (Array.isArray(rec.indices)) {
+                    rec.indices.forEach((idx: number) => {
+                        // Only set if not already mapped (higher-scored recs come first after sort)
+                        if (!rowIndexToIssueCategory.has(idx)) {
+                            rowIndexToIssueCategory.set(idx, rec.topic);
+                        }
+                    });
+                }
+            });
+        });
+
+        // Stamp ISSUE_CATEGORY onto every categorized row in buckets 1–3
+        categorizedRows.forEach((row, rowIdx) => {
+            if (!row.BUCKET || row.BUCKET === '0') return;
+
+            const topicKey = (row.TOPIC || '').toLowerCase().trim();
+            const bktRecs = row.BUCKET === '1' ? bucket1 : row.BUCKET === '2' ? bucket2 : bucket3;
+
+            // Priority 1: topic-level mapping built by buildIssueCategoryMap (AI issue_category / keyword match)
+            const topicLevelCategory = topicToIssueCategory[topicKey];
+            if (topicLevelCategory) {
+                (row as any).ISSUE_CATEGORY = topicLevelCategory;
+                return;
+            }
+
+            // Priority 2: direct row-index match from rec.indices (covers index-expansion rows)
+            const indexLevelCategory = rowIndexToIssueCategory.get(rowIdx);
+            if (indexLevelCategory) {
+                (row as any).ISSUE_CATEGORY = indexLevelCategory;
+                return;
+            }
+
+            // Priority 3: any other row in the same topic cluster already resolved → reuse it
+            // (handles rows whose topic wasn't in top-50 but share a topic with one that was)
+            if (topicKey) {
+                // Walk all rows that share this topic and have already been stamped
+                const clusterIndices = allClusters.find(
+                    c => (c.topic || '').toLowerCase().trim() === topicKey
+                )?.row_indices;
+                if (clusterIndices) {
+                    for (const ci of clusterIndices) {
+                        const sibling = categorizedRows[ci];
+                        if (sibling && (sibling as any).ISSUE_CATEGORY) {
+                            (row as any).ISSUE_CATEGORY = (sibling as any).ISSUE_CATEGORY;
+                            return;
+                        }
                     }
                 }
+            }
+
+            // Priority 4: ultimate fallback — use the top rec in the assigned bucket
+            if (bktRecs && bktRecs.length > 0) {
+                (row as any).ISSUE_CATEGORY = bktRecs[0].topic;
             }
         });
 
@@ -542,11 +688,12 @@ export async function analyzeWithBatching(
         log.bucket3Count = b3;
         log.rowsAccountedFor = categorizedRows.length; // In this system, all rows are accounted for (bucketed to something)
 
+        const totalBatchesCount = 1 + totalStrategicBatches + 1;
         onProgress({
-            currentBatch: 2,
-            totalBatches: 2,
+            currentBatch: totalBatchesCount,
+            totalBatches: totalBatchesCount,
             stage: 'done',
-            message: `Analysis complete — ${csvData.length} rows processed.`,
+            message: `Analysis complete — ${csvData.length} rows processed across ${top50Clusters.length} clusters.`,
         });
 
         finaliseLog(log);
@@ -554,7 +701,7 @@ export async function analyzeWithBatching(
         return {
             categorizedRows,
             recommendations: { bucket1, bucket2, bucket3 },
-            clusterSummaries: top20Clusters,
+            clusterSummaries: top50Clusters,
             totalRowsProcessed: csvData.length,
             analysisLog: log
         };

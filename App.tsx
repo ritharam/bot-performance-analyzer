@@ -2,8 +2,8 @@ import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import XLSXStyle from 'xlsx-js-style';
 import Papa from 'papaparse';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
-import { exportLogAsMarkdown } from './services/analysisLogger';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, Label } from 'recharts';
+import { saveLogToStorage, downloadLogAsMarkdown } from './services/analysisLogger';
 import { analyzeConversations, analyzeConversationsWithBatching } from './services/aiService';
 import { generateBotSummary } from './services/botProcessor';
 import { ConversationRow, AnalysisSummary, AnalysisResult, BucketRecommendation, ModelOption, BatchAnalysisProgress } from './types';
@@ -226,7 +226,8 @@ const App: React.FC = () => {
       );
       setAnalysisResult(result);
       if (result.analysisLog) {
-        exportLogAsMarkdown(result.analysisLog);
+        // Persist to localStorage under a fixed key — overwrites previous run, no download
+        saveLogToStorage(result.analysisLog);
       }
       setAnalysisProgress(null);
       setViewMode('dashboard');
@@ -252,15 +253,73 @@ const App: React.FC = () => {
   };
 
   const summary = useMemo<AnalysisSummary>(() => {
-    if (!analysisResult) return { totalChats: 0, statusBreakdown: {}, bucketDistribution: {} };
+    if (!analysisResult) return { totalChats: 0, statusBreakdown: {}, bucketDistribution: {}, sentimentBreakdown: {}, csatScore: 0 };
     const stats: Record<string, number> = {};
     const bDist: Record<string, number> = { '1': 0, '2': 0, '3': 0 };
-    analysisResult.categorizedRows.forEach((r: any) => {
-      const statusKey = (r.RESOLUTION_STATUS || 'Unknown').trim();
-      stats[statusKey] = (stats[statusKey] || 0) + 1;
+    const sentDist: Record<string, number> = {};
+    let positiveCount = 0;
+    let totalSentimentRows = 0;
+
+    const rows = analysisResult.categorizedRows as any[];
+    // Detect data type from first row fields
+    const isVoiceLog = rows.length > 0 && 'CALL_ID' in rows[0];
+    const isChatLog  = rows.length > 0 && 'Session Id' in rows[0];
+
+    rows.forEach((r: any) => {
+      // Resolution status (CRA only)
+      if (!isVoiceLog && !isChatLog) {
+        const statusKey = (r.RESOLUTION_STATUS || 'Unknown').trim();
+        stats[statusKey] = (stats[statusKey] || 0) + 1;
+      }
       if (r.BUCKET && r.BUCKET !== '0') bDist[r.BUCKET] = (bDist[r.BUCKET] || 0) + 1;
+
+      // ── Sentiment / CSAT source per data type ──────────────────────────────
+      // CRA data:    USER_SENTIMENT  → "positive" | "neutral" | "negative"
+      // Voice logs:  HANGUP_REASON   → map to positive (COMPLETED) / negative (others)
+      // Chat logs:   Feedback        → map non-empty positive feedback vs negative/none
+      let rawSentiment = '';
+      let normalisedLabel = '';
+
+      if (isVoiceLog) {
+        rawSentiment = (r.HANGUP_REASON || '').toLowerCase().trim();
+        // Treat completed / customer-hung-up (natural end) as positive; everything else as negative
+        normalisedLabel = rawSentiment === '' || rawSentiment === 'completed' || rawSentiment === 'customer'
+          ? 'Positive' : 'Negative';
+      } else if (isChatLog) {
+        rawSentiment = (r['Feedback'] || '').toLowerCase().trim();
+        // Any non-empty positive feedback is positive; explicit negative or blank is negative
+        normalisedLabel = rawSentiment === 'positive' || rawSentiment === 'good' || rawSentiment === 'thumbs up' || rawSentiment === '👍'
+          ? 'Positive'
+          : rawSentiment === 'negative' || rawSentiment === 'bad' || rawSentiment === 'thumbs down' || rawSentiment === '👎'
+          ? 'Negative'
+          : 'Neutral';
+      } else {
+        // CRA data — USER_SENTIMENT is already normalised
+        rawSentiment = (r.USER_SENTIMENT || '').toLowerCase().trim();
+        normalisedLabel = rawSentiment === 'positive' ? 'Positive'
+          : rawSentiment === 'negative' ? 'Negative'
+          : rawSentiment === 'neutral'  ? 'Neutral'
+          : 'Unknown';
+      }
+
+      if (normalisedLabel && normalisedLabel !== 'Unknown') {
+        sentDist[normalisedLabel] = (sentDist[normalisedLabel] || 0) + 1;
+        totalSentimentRows++;
+        if (normalisedLabel === 'Positive') positiveCount++;
+      }
     });
-    return { totalChats: analysisResult.categorizedRows.length, statusBreakdown: stats, bucketDistribution: bDist };
+
+    // CSAT = % of positive + neutral rows (industry standard: satisfied = not negative)
+    const satisfiedCount = (sentDist['Positive'] || 0) + (sentDist['Neutral'] || 0);
+    const csatScore = totalSentimentRows > 0 ? Math.round((satisfiedCount / totalSentimentRows) * 100) : 0;
+
+    return {
+      totalChats: analysisResult.categorizedRows.length,
+      statusBreakdown: stats,
+      bucketDistribution: bDist,
+      sentimentBreakdown: sentDist,
+      csatScore,
+    };
   }, [analysisResult]);
 
   const filteredRows = useMemo(() => {
@@ -437,34 +496,48 @@ const App: React.FC = () => {
         return map.get(rec) ?? 0;
       };
 
-      // ── Row → Issue Category (strict whitelist, no fallback guessing) ─────────
-      // Valid Issue Category values are STRICTLY the rec.topic strings written into
-      // the bucket sheets. A row only gets an Issue Category if its ISSUE_CATEGORY
-      // field (stamped by the AI pipeline in batchAnalysisService) is present AND
-      // exists in that bucket's exact whitelist. No fuzzy matching, no fallbacks,
-      // no cross-bucket bleed. If unconfirmed → cell stays empty.
+      // ── Row → Issue Category ──────────────────────────────────────────────────
+      // Every row in bucket 1, 2, or 3 MUST have an Issue Category value.
+      // Resolution order:
+      //   1. ISSUE_CATEGORY stamped on the row by batchAnalysisService
+      //      → resolved case-insensitively against that bucket's rec.topic list
+      //        so the cell always shows the exact casing from the bucket sheet.
+      //   2. Fallback: first (highest-priority) rec.topic in the assigned bucket.
+      // Bucket-0 rows always stay blank (intentional — not actionable).
 
-      // Step 1: Build per-bucket whitelists from the actual rec.topic values
-      const validRecTopics: Record<string, Set<string>> = {
-        '1': new Set(analysisResult.recommendations.bucket1.map((r: BucketRecommendation) => r.topic)),
-        '2': new Set(analysisResult.recommendations.bucket2.map((r: BucketRecommendation) => r.topic)),
-        '3': new Set(analysisResult.recommendations.bucket3.map((r: BucketRecommendation) => r.topic)),
+      // Step 1: Build per-bucket case-insensitive lookup: lowerTopic → canonical rec.topic
+      const canonicalTopic: Record<string, Map<string, string>> = {
+        '1': new Map(analysisResult.recommendations.bucket1.map((r: BucketRecommendation) => [r.topic.toLowerCase().trim(), r.topic])),
+        '2': new Map(analysisResult.recommendations.bucket2.map((r: BucketRecommendation) => [r.topic.toLowerCase().trim(), r.topic])),
+        '3': new Map(analysisResult.recommendations.bucket3.map((r: BucketRecommendation) => [r.topic.toLowerCase().trim(), r.topic])),
       };
 
-      // Step 2: For each row, accept ISSUE_CATEGORY only if it is in that row's
-      // bucket's whitelist. Reject anything else — leave the cell blank.
+      // Step 2: Resolve Issue Category for every bucketed row — guaranteed non-empty.
       const rowIssueCatMap = new Map<number, string>();
       rows.forEach((r: any, idx: number) => {
         const bkt = r.BUCKET || '0';
-        if (bkt !== '1' && bkt !== '2' && bkt !== '3') return; // not bucketed → skip
-        const allowed = validRecTopics[bkt];
-        if (!allowed || allowed.size === 0) return;
+        if (bkt !== '1' && bkt !== '2' && bkt !== '3') return; // bucket-0 → intentionally blank
+
+        const lookup = canonicalTopic[bkt];
+
+        // Priority 1: match the stamped ISSUE_CATEGORY case-insensitively → use canonical casing
         const ic = clean((r as any).ISSUE_CATEGORY);
-        // Only set if the value is exactly in the whitelist for THIS bucket
-        if (ic && allowed.has(ic)) {
-          rowIssueCatMap.set(idx, ic);
+        if (ic) {
+          const canonical = lookup.get(ic.toLowerCase().trim());
+          if (canonical) {
+            rowIssueCatMap.set(idx, canonical);
+            return;
+          }
         }
-        // No fallback — if unconfirmed, the cell will be empty
+
+        // Priority 2: fallback — use the first (highest-priority) rec in this bucket
+        const recs =
+          bkt === '1' ? analysisResult.recommendations.bucket1
+          : bkt === '2' ? analysisResult.recommendations.bucket2
+          : analysisResult.recommendations.bucket3;
+        if (recs && recs.length > 0) {
+          rowIssueCatMap.set(idx, (recs[0] as BucketRecommendation).topic);
+        }
       });
 
       const reportTitle = `${botTitle || 'Chat Bot'} — Resolution Analysis`;
@@ -1448,6 +1521,15 @@ const App: React.FC = () => {
           {analysisResult && viewMode !== 'setup' && (
             <button onClick={() => setViewMode('setup')} className="bg-slate-700 hover:bg-slate-600 px-6 py-2 rounded-full font-black text-[10px] uppercase transition-all flex items-center gap-2"><i className="fas fa-cog"></i> Settings</button>
           )}
+          {analysisResult?.analysisLog && viewMode !== 'setup' && (
+            <button
+              onClick={() => downloadLogAsMarkdown(analysisResult.analysisLog!)}
+              title="Download the analysis run log as a single overwriting .md file"
+              className="bg-slate-600 hover:bg-slate-500 px-6 py-2 rounded-full font-black text-[10px] uppercase transition-all flex items-center gap-2"
+            >
+              <i className="fas fa-file-code"></i> Download Log
+            </button>
+          )}
           {analysisResult && viewMode === 'dashboard' && (
             <button onClick={() => setViewMode('report')} className="bg-indigo-600 hover:bg-indigo-700 px-6 py-2 rounded-full font-black text-[10px] uppercase transition-all flex items-center gap-2"><i className="fas fa-file-alt"></i> View Full Report</button>
           )}
@@ -1651,7 +1733,63 @@ const SummaryView: React.FC<{ summary: AnalysisSummary; isReport?: boolean }> = 
       </div>
     )}
     <div className={`grid ${isReport ? 'grid-cols-1 gap-4' : 'lg:grid-cols-2 gap-16'}`}>
-      <div className={`${isReport ? 'p-4' : 'p-12'} border rounded-[1.5rem] bg-slate-50/20`}><h3 className="text-[8px] font-black mb-4 text-center uppercase tracking-widest text-slate-400">Outcomes</h3><div className={`${isReport ? 'h-[150px]' : 'h-[350px]'}`}><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={Object.entries(summary.statusBreakdown).map(([n, v]) => ({ n, v }))} cx="50%" cy="50%" innerRadius={isReport ? 30 : 80} outerRadius={isReport ? 50 : 120} paddingAngle={5} dataKey="v"><Cell fill="#4f46e5" /><Cell fill="#f43f5e" /><Cell fill="#f59e0b" /><Cell fill="#10b981" /><Cell fill="#6366f1" /></Pie>{!isReport && <Tooltip />}{!isReport && <Legend verticalAlign="bottom" />}</PieChart></ResponsiveContainer></div></div>
+      {/* ── CSAT Donut Chart ─────────────────────────────────────────────── */}
+      {(() => {
+        const CSAT_COLORS: Record<string, string> = { Positive: '#10b981', Neutral: '#f59e0b', Negative: '#f43f5e' };
+        const csatData = ['Positive', 'Neutral', 'Negative']
+          .filter(k => (summary.sentimentBreakdown[k] || 0) > 0)
+          .map(k => ({ name: k, value: summary.sentimentBreakdown[k] || 0, fill: CSAT_COLORS[k] }));
+        const emptyData = csatData.length === 0;
+        const displayData = emptyData ? [{ name: 'No data', value: 1, fill: '#e2e8f0' }] : csatData;
+        return (
+          <div className={`${isReport ? 'p-4' : 'p-12'} border rounded-[1.5rem] bg-slate-50/20`}>
+            <h3 className={`${isReport ? 'text-[8px]' : 'text-xs'} font-black mb-1 text-center uppercase tracking-widest text-slate-400`}>Customer Satisfaction (CSAT)</h3>
+            {!isReport && <p className="text-center text-[10px] text-slate-400 mb-4">Based on user sentiment across all conversations</p>}
+            <div className={`${isReport ? 'h-[160px]' : 'h-[350px]'}`}>
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={displayData}
+                    cx="50%" cy="50%"
+                    innerRadius={isReport ? 35 : 90}
+                    outerRadius={isReport ? 55 : 130}
+                    paddingAngle={emptyData ? 0 : 3}
+                    dataKey="value"
+                    startAngle={90}
+                    endAngle={-270}
+                  >
+                    {displayData.map((entry, index) => (
+                      <Cell key={`csat-${index}`} fill={entry.fill} />
+                    ))}
+                    <Label
+                      content={({ viewBox }: any) => {
+                        const { cx, cy } = viewBox;
+                        return (
+                          <g>
+                            <text x={cx} y={cy - (isReport ? 6 : 14)} textAnchor="middle" dominantBaseline="middle" className="fill-slate-800" style={{ fontSize: isReport ? 14 : 32, fontWeight: 900 }}>
+                              {emptyData ? '—' : `${summary.csatScore}%`}
+                            </text>
+                            <text x={cx} y={cy + (isReport ? 8 : 20)} textAnchor="middle" dominantBaseline="middle" className="fill-slate-400" style={{ fontSize: isReport ? 6 : 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                              {emptyData ? 'No Data' : 'CSAT Score'}
+                            </text>
+                          </g>
+                        );
+                      }}
+                    />
+                  </Pie>
+                  <Tooltip formatter={(value: any, name: string) => [`${value} chats`, name]} />
+                  <Legend
+                    verticalAlign="bottom"
+                    iconType="circle"
+                    iconSize={isReport ? 6 : 10}
+                    formatter={(value) => <span style={{ fontSize: isReport ? 7 : 11, fontWeight: 700 }}>{value}</span>}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        );
+      })()}
       {!isReport && (<div className="p-12 border rounded-[2rem] bg-slate-50/20"><h3 className="text-xs font-black mb-10 text-center uppercase tracking-widest text-slate-400">Pillar Mapping</h3><div className="h-[350px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={[{ name: 'Expansion', value: summary.bucketDistribution['1'], fill: '#f43f5e' }, { name: 'Optimization', value: summary.bucketDistribution['2'], fill: '#f59e0b' }, { name: 'Knowledge', value: summary.bucketDistribution['3'], fill: '#10b981' },]}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" /><YAxis /><Tooltip /><Bar dataKey="value" radius={[10, 10, 0, 0]} /></BarChart></ResponsiveContainer></div></div>)}
     </div>
   </div>

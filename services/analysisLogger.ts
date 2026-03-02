@@ -40,8 +40,15 @@ export const finaliseLog = (log: AnalysisLog): AnalysisLog => {
     return log;
 };
 
-export const exportLogAsMarkdown = (log: AnalysisLog) => {
-    if (!log) return;
+/** Fixed localStorage key — always overwritten, never accumulates new files */
+export const ANALYSIS_LOG_STORAGE_KEY = 'bot_analysis_log';
+
+/**
+ * Serialises the log to a Markdown string.
+ * Does NOT trigger any download — call downloadLogAsMarkdown() for that.
+ */
+export const buildLogMarkdown = (log: AnalysisLog): string => {
+    if (!log) return '';
 
     const sections = [
         {
@@ -68,7 +75,7 @@ export const exportLogAsMarkdown = (log: AnalysisLog) => {
         },
         {
             title: "3. Clustering",
-            headers: ["Total Clusters", "Top Selected", "Dropped"],
+            headers: ["Total Clusters", "Top 50 Selected (by conversation count)", "Dropped"],
             rows: [[
                 log.totalClustersGenerated,
                 log.topClustersSelected,
@@ -77,14 +84,15 @@ export const exportLogAsMarkdown = (log: AnalysisLog) => {
         },
         {
             title: "Clustering Detail",
-            headers: ["Rank", "Topic", "Total Rows", "Failure Rate", "Negative Rate", "Sent to AI"],
+            headers: ["Rank", "Topic", "Total Conversations", "Failure Rate", "Negative Rate", "Sent to AI", "Batch #"],
             rows: log.clusterDetails.map(c => [
                 c.rank,
                 c.topic,
                 c.total,
                 `${(c.failure_rate * 100).toFixed(1)}%`,
                 `${(c.negative_rate * 100).toFixed(1)}%`,
-                c.sentToAI ? "YES" : "NO"
+                c.sentToAI ? "YES" : "NO",
+                c.batchNumber ?? "--"
             ])
         },
         {
@@ -149,13 +157,55 @@ export const exportLogAsMarkdown = (log: AnalysisLog) => {
         });
     }
 
+    return md;
+};
+
+/**
+ * Persists the log markdown to localStorage under a fixed key so each
+ * execution overwrites the previous one — no new files accumulate.
+ */
+export const saveLogToStorage = (log: AnalysisLog): void => {
+    if (!log) return;
+    const md = buildLogMarkdown(log);
+    try {
+        localStorage.setItem(ANALYSIS_LOG_STORAGE_KEY, md);
+    } catch (e) {
+        console.warn('Could not save analysis log to localStorage:', e);
+    }
+};
+
+/**
+ * Reads the stored log markdown from localStorage.
+ * Returns null if nothing has been stored yet.
+ */
+export const loadLogFromStorage = (): string | null => {
+    try {
+        return localStorage.getItem(ANALYSIS_LOG_STORAGE_KEY);
+    } catch (e) {
+        return null;
+    }
+};
+
+/**
+ * Triggers a one-off browser download of the current stored log as
+ * `analysis_log.md` (fixed filename — always overwrites the previous copy
+ * in the user's Downloads folder when the browser is set to auto-accept).
+ * Only called when the user explicitly clicks "Download Log".
+ */
+export const downloadLogAsMarkdown = (log: AnalysisLog): void => {
+    if (!log) return;
+    const md = buildLogMarkdown(log);
     const blob = new Blob([md], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `analysis_log_${log.runId}.md`;
+    // Fixed filename — no runId suffix so the file overwrites itself in Downloads
+    a.download = 'analysis_log.md';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 };
+
+/** @deprecated Use saveLogToStorage + downloadLogAsMarkdown instead */
+export const exportLogAsMarkdown = saveLogToStorage;

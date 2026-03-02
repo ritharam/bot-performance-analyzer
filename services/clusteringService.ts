@@ -79,6 +79,7 @@ export function buildClusterSummaries(rows: ConversationRow[]): ClusterSummary[]
 
         summaries.push({
             topic: originalTopic,
+            rank: 0, // assigned after sort
             total,
             unresolved,
             resolution_attempted,
@@ -94,8 +95,11 @@ export function buildClusterSummaries(rows: ConversationRow[]): ClusterSummary[]
         });
     });
 
-    // Sort by failure_rate descending
-    summaries.sort((a, b) => b.failure_rate - a.failure_rate);
+    // Sort by total (conversation count) descending — Rank 1 = most conversations
+    summaries.sort((a, b) => b.total - a.total);
+
+    // Assign rank after sorting (1-based, Rank 1 = highest conversation count)
+    summaries.forEach((s, i) => { s.rank = i + 1; });
 
     return summaries;
 }
