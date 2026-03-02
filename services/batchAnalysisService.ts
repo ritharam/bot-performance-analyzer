@@ -1,8 +1,7 @@
-import { ConversationRow, AnalysisResult, BucketRecommendation, ModelOption, BatchAnalysisProgress, AnalysisLog } from '../types';
+import { ConversationRow, AnalysisResult, BucketRecommendation, ModelOption, BatchAnalysisProgress } from '../types';
 import { buildClusterSummaries, getFailureRows, assignBucketsByTopic } from './clusteringService';
 import { createLog, finaliseLog } from './analysisLogger';
 import { runAllValidations } from './validationService';
-
 
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 
@@ -39,7 +38,6 @@ async function withRetry<T>(
         return await operation();
     } catch (error: any) {
         if (retries > 0) {
-            // Check for 429 (Too Many Requests) or 5xx (Server Errors) to retry
             const status = error.status || error.response?.status;
             const message = error.message || '';
             const shouldRetry = status === 429 || (status >= 500 && status < 600) || message.includes('Rate limit') || message.includes('quota');
@@ -102,7 +100,6 @@ async function callGemini(prompt: string, apiKey: string): Promise<any> {
             });
             return response.text;
         } catch (err: any) {
-            // Normalize Gemini SDK errors
             const message = err.message || 'Unknown Gemini error';
             const error: any = new Error(`Gemini API error: ${message}`);
             if (message.includes('429') || message.includes('ResourceExhausted')) error.status = 429;
@@ -123,19 +120,22 @@ async function callAI(prompt: string, model: ModelOption, apiKey: string): Promi
 // ---------------------------------------------------------------------------
 
 function buildStrategicPrompt(
-    top20Clusters: ReturnType<typeof buildClusterSummaries>,
+    clusters: ReturnType<typeof buildClusterSummaries>,
     botSummary: string,
     goals: string,
-    csvData: ConversationRow[]
+    csvData: ConversationRow[],
+    batchNumber: number,
+    totalBatches: number
 ): string {
     return `Act as a senior Chatbot Performance Strategist.
 
 BUSINESS GOALS: "${goals}"
 
-BOT SUMMARY: ${botSummary.slice(0, 5000)}
+BOT SUMMARY: ${botSummary.slice(0, 3000)}
 
-DATASET: ${csvData.length} total conversations. Below are the top 20 failure topic clusters (sorted by failure rate):
-${JSON.stringify(top20Clusters.map(c => ({
+DATASET: ${csvData.length} total conversations. Below are ${clusters.length} topic clusters (Batch ${batchNumber} of ${totalBatches}, ranked by conversation volume — Rank 1 has most conversations):
+${JSON.stringify(clusters.map(c => ({
+        rank: c.rank,
         topic: c.topic,
         total: c.total,
         failure_rate: Math.round(c.failure_rate * 100) + '%',
@@ -145,7 +145,7 @@ ${JSON.stringify(top20Clusters.map(c => ({
         sample_queries: c.sample_queries
     })))}
 
-TASK: For each topic cluster, assign it to a bucket and return full recommendations.
+TASK: For each topic cluster, assign it to a bucket and return full recommendations. Prioritise clusters with higher conversation counts (lower rank number) as they impact more users.
 
 Buckets:
 - "1" = Service Expansion: no handler exists, new intent/flow needed
@@ -207,38 +207,70 @@ function mergeRecommendations(
     for (const rec of [...strategic, ...detail]) {
         const key = (rec.topic || '').toLowerCase().trim();
         const existing = map.get(key);
-        if (!existing || (rec.goalAlignmentScore || 0) > (existing.goalAlignmentScore || 0)) {
+        if (!existing) {
             map.set(key, rec);
+        } else {
+            const existingCount = (existing as any).count || 0;
+            const recCount = (rec as any).count || 0;
+            if (
+                recCount > existingCount ||
+                (recCount === existingCount && (rec.goalAlignmentScore || 0) > (existing.goalAlignmentScore || 0))
+            ) {
+                map.set(key, rec);
+            }
         }
     }
 
-    return Array.from(map.values()).sort(
-        (a, b) => (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0)
-    );
+    return Array.from(map.values()).sort((a, b) => {
+        const countDiff = ((b as any).count || 0) - ((a as any).count || 0);
+        if (countDiff !== 0) return countDiff;
+        return (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0);
+    });
 }
 
 function processBucket(
     recs: any[],
     categorizedRows: ConversationRow[],
     bucketId: string,
-    label: string
+    label: string,
+    clustersByTopic?: Map<string, number[]>
 ): BucketRecommendation[] {
     (recs || []).forEach((rec) => {
-        if (Array.isArray(rec.indices)) {
-            rec.indices = rec.indices.filter(
+        const llmIndices: number[] = Array.isArray(rec.indices)
+            ? rec.indices.filter(
                 (idx: number) =>
                     Number.isInteger(idx) && idx >= 0 && idx < categorizedRows.length
-            );
-            rec.count = rec.indices.length;
-            rec.indices.forEach((idx: number) => {
-                categorizedRows[idx].BUCKET = bucketId;
-                categorizedRows[idx].BUCKET_LABEL = label;
+            )
+            : [];
+
+        const expandedSet = new Set<number>(llmIndices);
+        if (clustersByTopic && rec.topic) {
+            const recTopicLower = (rec.topic || '').toLowerCase().trim();
+            clustersByTopic.forEach((indices, clusterTopic) => {
+                if (
+                    clusterTopic.includes(recTopicLower) ||
+                    recTopicLower.includes(clusterTopic)
+                ) {
+                    indices.forEach((idx) => {
+                        if (idx >= 0 && idx < categorizedRows.length) expandedSet.add(idx);
+                    });
+                }
             });
         }
+
+        rec.indices = Array.from(expandedSet);
+        rec.count = rec.indices.length;
+        rec.indices.forEach((idx: number) => {
+            categorizedRows[idx].BUCKET = bucketId;
+            categorizedRows[idx].BUCKET_LABEL = label;
+        });
     });
-    return (recs || []).sort(
-        (a: any, b: any) => (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0)
-    );
+
+    return (recs || []).sort((a: any, b: any) => {
+        const countDiff = (b.count || 0) - (a.count || 0);
+        if (countDiff !== 0) return countDiff;
+        return (b.goalAlignmentScore || 0) - (a.goalAlignmentScore || 0);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +293,10 @@ export async function analyzeWithBatching(
     log.csvFilteredOut = originalCsvStats?.filteredOut || 0;
     log.filterStatuses = originalCsvStats?.filterStatuses || [];
 
+    const CLUSTER_BATCH_SIZE = 25;
+    const TOP_N_CLUSTERS = 100;
+
     try {
-        // ── Stage 1: Clustering (pure TS, no API) ─────────────────────────────────
         onProgress({
             currentBatch: 0,
             totalBatches: 2,
@@ -272,62 +306,94 @@ export async function analyzeWithBatching(
 
         const allClusters = buildClusterSummaries(csvData);
         log.totalClustersGenerated = allClusters.length;
-        // INCREASED coverage: send top 100 clusters instead of 20
-        const topClusters = allClusters.slice(0, 100);
-        log.topClustersSelected = topClusters.length;
-        log.clustersDropped = Math.max(0, allClusters.length - 100);
 
-        log.clusterDetails = allClusters.map((c, i) => ({
-            rank: i + 1,
+        const topClustersSelected = allClusters.slice(0, TOP_N_CLUSTERS);
+        log.topClustersSelected = topClustersSelected.length;
+        log.clustersDropped = Math.max(0, allClusters.length - TOP_N_CLUSTERS);
+
+        log.clusterDetails = allClusters.map((c) => ({
+            rank: c.rank,
             topic: c.topic,
             total: c.total,
             failure_rate: c.failure_rate,
             negative_rate: c.negative_rate,
-            sentToAI: i < 100
+            sentToAI: c.rank <= TOP_N_CLUSTERS,
         }));
 
-        // ── Stage 2: Strategic API call ───────────────────────────────────────────
+        const clusterBatches: typeof topClustersSelected[] = [];
+        for (let i = 0; i < topClustersSelected.length; i += CLUSTER_BATCH_SIZE) {
+            clusterBatches.push(topClustersSelected.slice(i, i + CLUSTER_BATCH_SIZE));
+        }
+        const totalStrategicBatches = clusterBatches.length;
+
         onProgress({
             currentBatch: 1,
-            totalBatches: 2,
+            totalBatches: 1 + totalStrategicBatches + 1,
             stage: 'strategic',
-            message: 'Mapping improvement areas...',
+            message: `Mapping improvement areas across ${topClustersSelected.length} clusters in ${totalStrategicBatches} batch(es)...`,
         });
 
-        const strategicStartTime = Date.now();
-        const strategicPrompt = buildStrategicPrompt(topClusters, botSummary, goals, csvData);
-        let strategicRaw = "";
-        let strategicSuccess = false;
-        let strategicError = "";
+        const mergedStrategicParsed: {
+            topic_assignments: any[];
+            bucket1: any[];
+            bucket2: any[];
+            bucket3: any[];
+        } = { topic_assignments: [], bucket1: [], bucket2: [], bucket3: [] };
 
-        try {
-            strategicRaw = await callAI(strategicPrompt, model, apiKey);
-            strategicSuccess = true;
-        } catch (e: any) {
-            strategicError = e.message || String(e);
-            log.errors.push(`Stage 2 (Strategic) API Error: ${strategicError}`);
+        for (let bIdx = 0; bIdx < clusterBatches.length; bIdx++) {
+            const batch = clusterBatches[bIdx];
+            const batchNum = bIdx + 1;
+            const strategicStartTime = Date.now();
+            const strategicPrompt = buildStrategicPrompt(batch, botSummary, goals, csvData, batchNum, totalStrategicBatches);
+            let strategicRaw = "";
+            let strategicSuccess = false;
+            let strategicError = "";
+
+            try {
+                strategicRaw = await callAI(strategicPrompt, model, apiKey);
+                strategicSuccess = true;
+            } catch (e: any) {
+                strategicError = e.message || String(e);
+                log.errors.push(`Stage 2 Batch ${batchNum} (Strategic) API Error: ${strategicError}`);
+            }
+
+            log.batchSummary.push({
+                batchName: `Stage 2 Batch ${batchNum}/${totalStrategicBatches}: Strategic Mapping (clusters ${(bIdx * CLUSTER_BATCH_SIZE) + 1}–${Math.min((bIdx + 1) * CLUSTER_BATCH_SIZE, topClustersSelected.length)})`,
+                inputSize: batch.length,
+                tokenEstimate: strategicPrompt.length / 4,
+                durationMs: Date.now() - strategicStartTime,
+                success: strategicSuccess,
+                errorMessage: strategicError || undefined,
+            });
+
+            batch.forEach(c => {
+                const detail = log.clusterDetails.find(d => d.topic === c.topic);
+                if (detail) detail.batchNumber = batchNum;
+            });
+
+            const batchParsed = safeJsonParse<any>(strategicRaw, {
+                topic_assignments: [],
+                bucket1: [],
+                bucket2: [],
+                bucket3: [],
+            });
+
+            mergedStrategicParsed.topic_assignments.push(...(batchParsed.topic_assignments || []));
+            mergedStrategicParsed.bucket1.push(...(batchParsed.bucket1 || []));
+            mergedStrategicParsed.bucket2.push(...(batchParsed.bucket2 || []));
+            mergedStrategicParsed.bucket3.push(...(batchParsed.bucket3 || []));
+
+            onProgress({
+                currentBatch: 1 + batchNum,
+                totalBatches: 1 + totalStrategicBatches + 1,
+                stage: 'strategic',
+                message: `Strategic batch ${batchNum}/${totalStrategicBatches} complete...`,
+            });
         }
 
-        log.batchSummary.push({
-            batchName: "Stage 2: Strategic Mapping",
-            inputSize: topClusters.length,
-            tokenEstimate: strategicPrompt.length / 4, // Rough estimate
-            durationMs: Date.now() - strategicStartTime,
-            success: strategicSuccess,
-            errorMessage: strategicError || undefined
-        });
-
-        const strategicParsed = safeJsonParse<any>(strategicRaw, {
-            topic_assignments: [],
-            bucket1: [],
-            bucket2: [],
-            bucket3: [],
-        });
-
-        // Build topic → bucket/label maps from AI response
+        const strategicParsed = mergedStrategicParsed;
         const topicToBucket: Record<string, string> = {};
         const topicToLabel: Record<string, string> = {};
-        // Maps granular cluster topic → the specific Issue Category (rec.topic) within its bucket
         const topicToIssueCategory: Record<string, string> = {};
 
         const assignments: Array<{ topic: string; bucket: string; bucket_label?: string; label?: string; issue_category?: string; reason?: string }> =
@@ -339,19 +405,16 @@ export async function analyzeWithBatching(
             const key = (topic || '').toLowerCase().trim();
             topicToBucket[key] = bucket || '0';
             topicToLabel[key] = bucket_label || label || 'Resolved / Out of Scope';
-            // If the AI provided issue_category, use it directly — most reliable mapping
             if (issue_category && bucket !== '0') {
                 topicToIssueCategory[key] = issue_category;
             }
         });
 
-        // ── Stage 3: Detail API call ──────────────────────────────────────────────
-        // INCREASED sampling: 500 rows instead of 150
         const failureEntry = getFailureRows(csvData, 500);
 
         onProgress({
-            currentBatch: 2,
-            totalBatches: 2,
+            currentBatch: 1 + totalStrategicBatches,
+            totalBatches: 1 + totalStrategicBatches + 1,
             stage: 'detail',
             message: 'Preparing smart recommendations...',
         });
@@ -385,74 +448,55 @@ export async function analyzeWithBatching(
             bucket3: [],
         });
 
-        // ── Stage 4: Merging ──────────────────────────────────────────────────────
         onProgress({
-            currentBatch: 2,
-            totalBatches: 2,
+            currentBatch: 1 + totalStrategicBatches + 1,
+            totalBatches: 1 + totalStrategicBatches + 1,
             stage: 'merging',
             message: `Merging results across all ${csvData.length} rows...`,
         });
 
-        // Assign buckets to ALL rows by topic first (from strategic call)
         const categorizedRows: ConversationRow[] = assignBucketsByTopic(
             csvData,
             topicToBucket,
             topicToLabel
         );
 
-        // Count how many were successfully mapped from strategic assignments
-        let mappedCount = 0;
+        let uniqueTopicsMappedSet = new Set<string>();
         categorizedRows.forEach(r => {
             const key = (r.TOPIC || '').toLowerCase().trim();
-            if (topicToBucket[key]) mappedCount++;
+            if (topicToBucket[key]) uniqueTopicsMappedSet.add(key);
         });
-        log.topicAssignmentsMapped = mappedCount; // Actually this is rows mapped. 
-        // User asked for topicAssignmentsMapped... let's count unique topics in categorizedRows that have a bucket from strategic
-        const uniqueTopicsMapped = new Set(
-            categorizedRows
-                .filter(r => topicToBucket[(r.TOPIC || '').toLowerCase().trim()])
-                .map(r => (r.TOPIC || '').toLowerCase().trim())
-        ).size;
-        log.topicAssignmentsMapped = uniqueTopicsMapped;
-        log.topicAssignmentsUnmatched = Math.max(0, log.totalClustersGenerated - uniqueTopicsMapped);
+        log.topicAssignmentsMapped = uniqueTopicsMappedSet.size;
+        log.topicAssignmentsUnmatched = Math.max(0, log.totalClustersGenerated - uniqueTopicsMappedSet.size);
 
-        // Populate data loss topics (any cluster that wasn't assigned a bucket)
         log.dataLossTopics = allClusters
             .filter(c => !topicToBucket[(c.topic || '').toLowerCase().trim()])
             .map(c => c.topic);
 
-        // Apply detail overrides: for rows referenced in detail bucket recs, override BUCKET/BUCKET_LABEL
-        const strategicBucket1 = processBucket(strategicParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)');
-        const strategicBucket2 = processBucket(strategicParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)');
-        const strategicBucket3 = processBucket(strategicParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)');
+        const clustersByTopic = new Map<string, number[]>();
+        topClustersSelected.forEach((c) => {
+            clustersByTopic.set((c.topic || '').toLowerCase().trim(), c.row_indices);
+        });
 
-        const detailBucket1 = processBucket(detailParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)');
-        const detailBucket2 = processBucket(detailParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)');
-        const detailBucket3 = processBucket(detailParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)');
+        const strategicBucket1 = processBucket(strategicParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)', clustersByTopic);
+        const strategicBucket2 = processBucket(strategicParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)', clustersByTopic);
+        const strategicBucket3 = processBucket(strategicParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)', clustersByTopic);
 
-        // Merge strategic + detail for each bucket, de-duping by topic (higher score wins)
+        const detailBucket1 = processBucket(detailParsed.bucket1, categorizedRows, '1', 'Service Expansion (New Agent)', clustersByTopic);
+        const detailBucket2 = processBucket(detailParsed.bucket2, categorizedRows, '2', 'System Optimization (Logic Update)', clustersByTopic);
+        const detailBucket3 = processBucket(detailParsed.bucket3, categorizedRows, '3', 'Information Gaps (KB Update)', clustersByTopic);
+
         const bucket1 = mergeRecommendations(strategicBucket1, detailBucket1);
         const bucket2 = mergeRecommendations(strategicBucket2, detailBucket2);
         const bucket3 = mergeRecommendations(strategicBucket3, detailBucket3);
 
-        // ── Build topicToIssueCategory ─────────────────────────────────────────
-        // Maps each granular cluster topic → the specific rec.topic (Issue Category)
-        // within its bucket. Uses three strategies in order:
-        //   1. Direct index match: if any rec.indices contains rows whose TOPIC = clusterTopic
-        //   2. Keyword similarity: find the rec whose topic shares the most words
-        //   3. Fallback: assign the first (highest-scored) rec in that bucket
-
         const buildIssueCategoryMap = (
-            bucketRecs: typeof bucket1,
+            bucketRecs: BucketRecommendation[],
             bucketId: string,
             rows: ConversationRow[]
         ) => {
             if (!bucketRecs || bucketRecs.length === 0) return;
-
-            // Valid topics in this bucket for whitelist validation
             const validRecTopics = new Set(bucketRecs.map(r => r.topic));
-
-            // Build a map from rec.topic → set of granular topics covered via rec.indices
             const recTopicToGranularTopics = new Map<string, Set<string>>();
             bucketRecs.forEach((rec: any) => {
                 const covered = new Set<string>();
@@ -465,31 +509,21 @@ export async function analyzeWithBatching(
                 recTopicToGranularTopics.set(rec.topic, covered);
             });
 
-            // For each cluster topic assigned to this bucket, find the best rec.
             assignments.forEach(({ topic: clusterTopic, bucket }) => {
                 if (bucket !== bucketId) return;
                 const key = (clusterTopic || '').toLowerCase().trim();
                 if (!key) return;
-
-                // VALIDATE existing assignment from AI (topicToIssueCategory[key])
-                // If it doesn't exist in our actual bucketRecs, clear it to force recalculation
                 const existing = topicToIssueCategory[key];
                 if (existing && !validRecTopics.has(existing)) {
                     delete topicToIssueCategory[key];
                 }
-
-                // If already assigned and valid — skip
                 if (topicToIssueCategory[key]) return;
-
-                // 1. Direct: a rec's indices covers a row with this exact TOPIC
                 for (const [recTopic, granularSet] of recTopicToGranularTopics) {
                     if (granularSet.has(key)) {
                         topicToIssueCategory[key] = recTopic;
                         return;
                     }
                 }
-
-                // 2. Keyword similarity between cluster topic and each rec.topic
                 const clusterWords = new Set(key.split(/[\s_\-,]+/).filter((w: string) => w.length > 2));
                 let bestRec = '';
                 let bestScore = -1;
@@ -503,13 +537,10 @@ export async function analyzeWithBatching(
                     clusterWords.forEach((cw: string) => { if (recLower.includes(cw)) score += 1; });
                     if (score > bestScore) { bestScore = score; bestRec = rec.topic; }
                 });
-
                 if (bestRec && bestScore > 0) {
                     topicToIssueCategory[key] = bestRec;
                     return;
                 }
-
-                // 3. Fallback: first rec in bucket (highest goalAlignmentScore after sort)
                 topicToIssueCategory[key] = bucketRecs[0].topic;
             });
         };
@@ -518,26 +549,57 @@ export async function analyzeWithBatching(
         buildIssueCategoryMap(bucket2, '2', categorizedRows);
         buildIssueCategoryMap(bucket3, '3', categorizedRows);
 
-        // Now stamp ISSUE_CATEGORY onto every categorized row
-        categorizedRows.forEach((row) => {
-            const key = (row.TOPIC || '').toLowerCase().trim();
-            if (row.BUCKET && row.BUCKET !== '0') {
-                const issueCategory = topicToIssueCategory[key];
-                if (issueCategory) {
-                    (row as any).ISSUE_CATEGORY = issueCategory;
-                } else {
-                    // Bucket is known but no rec mapping — use the bucket's primary rec topic
-                    const bktRecs = row.BUCKET === '1' ? bucket1 : row.BUCKET === '2' ? bucket2 : bucket3;
-                    if (bktRecs && bktRecs.length > 0) {
-                        (row as any).ISSUE_CATEGORY = bktRecs[0].topic;
+        const rowIndexToIssueCategory = new Map<number, string>();
+        [
+            { recs: bucket1 },
+            { recs: bucket2 },
+            { recs: bucket3 },
+        ].forEach(({ recs }) => {
+            recs.forEach((rec: any) => {
+                if (Array.isArray(rec.indices)) {
+                    rec.indices.forEach((idx: number) => {
+                        if (!rowIndexToIssueCategory.has(idx)) {
+                            rowIndexToIssueCategory.set(idx, rec.topic);
+                        }
+                    });
+                }
+            });
+        });
+
+        categorizedRows.forEach((row, rowIdx) => {
+            if (!row.BUCKET || row.BUCKET === '0') return;
+            const topicKey = (row.TOPIC || '').toLowerCase().trim();
+            const bktRecs = row.BUCKET === '1' ? bucket1 : row.BUCKET === '2' ? bucket2 : bucket3;
+            const topicLevelCategory = topicToIssueCategory[topicKey];
+            if (topicLevelCategory) {
+                (row as any).ISSUE_CATEGORY = topicLevelCategory;
+                return;
+            }
+            const indexLevelCategory = rowIndexToIssueCategory.get(rowIdx);
+            if (indexLevelCategory) {
+                (row as any).ISSUE_CATEGORY = indexLevelCategory;
+                return;
+            }
+            if (topicKey) {
+                const clusterIndices = allClusters.find(
+                    c => (c.topic || '').toLowerCase().trim() === topicKey
+                )?.row_indices;
+                if (clusterIndices) {
+                    for (const ci of clusterIndices) {
+                        const sibling = categorizedRows[ci];
+                        if (sibling && (sibling as any).ISSUE_CATEGORY) {
+                            (row as any).ISSUE_CATEGORY = (sibling as any).ISSUE_CATEGORY;
+                            return;
+                        }
                     }
                 }
+            }
+            if (bktRecs && bktRecs.length > 0) {
+                (row as any).ISSUE_CATEGORY = bktRecs[0].topic;
             }
         });
 
         log.recommendationsGenerated = bucket1.length + bucket2.length + bucket3.length;
-
-        // Final counts
         let b0 = 0, b1 = 0, b2 = 0, b3 = 0;
         categorizedRows.forEach(r => {
             if (r.BUCKET === '1') b1++;
@@ -549,25 +611,24 @@ export async function analyzeWithBatching(
         log.bucket1Count = b1;
         log.bucket2Count = b2;
         log.bucket3Count = b3;
-        log.rowsAccountedFor = categorizedRows.length; // In this system, all rows are accounted for (bucketed to something)
+        log.rowsAccountedFor = categorizedRows.length;
 
+        const totalBatchesCount = 1 + totalStrategicBatches + 1;
         onProgress({
-            currentBatch: 2,
-            totalBatches: 2,
+            currentBatch: totalBatchesCount,
+            totalBatches: totalBatchesCount,
             stage: 'done',
-            message: `Analysis complete — ${csvData.length} rows processed.`,
+            message: `Analysis complete — ${csvData.length} rows processed across ${topClustersSelected.length} clusters.`,
         });
 
-        // ── Stage 5: Validation ───────────────────────────────────────────────────
         const allRecommendations = [...bucket1, ...bucket2, ...bucket3];
         log.validationResults = runAllValidations(allRecommendations, categorizedRows, allClusters);
-
         finaliseLog(log);
 
         return {
             categorizedRows,
             recommendations: { bucket1, bucket2, bucket3 },
-            clusterSummaries: topClusters,
+            clusterSummaries: topClustersSelected,
             totalRowsProcessed: csvData.length,
             analysisLog: log
         };

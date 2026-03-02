@@ -79,10 +79,15 @@ export interface AnalysisSummary {
   totalChats: number;
   statusBreakdown: Record<string, number>;
   bucketDistribution: Record<string, number>;
+  /** positive / neutral / negative counts — used for CSAT donut chart */
+  sentimentBreakdown: Record<string, number>;
+  /** CSAT score 0-100: % of non-negative conversations */
+  csatScore: number;
 }
 
 export interface ClusterSummary {
   topic: string;
+  rank: number; // 1 = most conversations
   total: number;
   unresolved: number;
   resolution_attempted: number;
@@ -133,6 +138,7 @@ export interface AnalysisLog {
     failure_rate: number;
     negative_rate: number;
     sentToAI: boolean;
+    batchNumber?: number;
   }[];
   batchSummary: {
     batchName: string;
